@@ -80,7 +80,8 @@ type Tab =
   | "news"
   | "alerts"
   | "sources"
-  | "settings";
+  | "settings"
+  | "markets";
 
 type AlertItem = {
   id: string;
