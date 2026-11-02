@@ -1,4 +1,3 @@
-
 import {
   useEffect,
   useMemo,
@@ -33,7 +32,11 @@ import {
   Plus,
   Trash2,
   Palette,
-  ChartNoAxesCombined
+  ChartNoAxesCombined,
+  TrendingUp,
+  TrendingDown,
+  Coins,
+  CircleDollarSign
 } from "lucide-react";
 
 import { api } from "./api";
@@ -83,12 +86,48 @@ type Tab =
   | "settings"
   | "markets";
 
+type MarketFilter =
+  | "all"
+  | "crypto"
+  | "forex"
+  | "commodity"
+  | "stock";
+
 type AlertItem = {
   id: string;
   title: string;
   detail: string;
   time: number;
 };
+
+type Theme = typeof defaultTheme;
+
+const marketFilters: {
+  id: MarketFilter;
+  label: string;
+}[] = [
+  { id: "all", label: "ALL" },
+  { id: "crypto", label: "CRYPTO" },
+  { id: "forex", label: "FOREX" },
+  { id: "commodity", label: "COMMODITIES" },
+  { id: "stock", label: "STOCKS" }
+];
+
+function formatPrice(value: number | null, currency: string) {
+  if (value === null || !Number.isFinite(value)) return "—";
+
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: value < 1 ? 6 : 2
+  }).format(value) + ` ${currency}`;
+}
+
+function formatChange(value?: number | null) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
 
 export default function App() {
   const mapNode = useRef<HTMLDivElement>(null);
@@ -110,7 +149,7 @@ export default function App() {
     }
   });
 
-  const [theme, setTheme] = useState(() => {
+  const [theme, setTheme] = useState<Theme>(() => {
     try {
       const saved = localStorage.getItem("sb-theme");
 
@@ -138,6 +177,16 @@ export default function App() {
 
   const [sources, setSources] = useState<NewsSource[]>([]);
 
+  const [marketItems, setMarketItems] = useState<MarketAsset[]>([]);
+  const [marketServices, setMarketServices] = useState<
+    Record<string, ProviderStatus>
+  >({});
+  const [marketFilter, setMarketFilter] =
+    useState<MarketFilter>("all");
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketError, setMarketError] = useState("");
+  const marketLoadingRef = useRef(false);
+
   const [activeTab, setActiveTab] = useState<Tab>("news");
 
   const [selected, setSelected] = useState<
@@ -150,6 +199,9 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [error, setError] = useState("");
 
+  const [mapReady, setMapReady] = useState(false);
+  const [mapError, setMapError] = useState("");
+
   const [newSourceName, setNewSourceName] = useState("");
   const [newSourceUrl, setNewSourceUrl] = useState("");
   const [newSourceCategory, setNewSourceCategory] =
@@ -157,6 +209,8 @@ export default function App() {
 
   const [sourceMessage, setSourceMessage] = useState("");
   const [tickerPaused, setTickerPaused] = useState(false);
+
+  // DATA LOADING
 
   const load = async () => {
     if (loadingRef.current) return;
@@ -210,23 +264,42 @@ export default function App() {
       );
 
       if (rejected.length > 0) {
-        setError(
-          "Some services are unavailable. Check Sources."
-        );
+        setError("Some services are unavailable. Check Sources.");
       }
 
       setLastUpdated(new Date());
 
     } catch (err: unknown) {
       setError(
-        err instanceof Error
-          ? err.message
-          : String(err)
+        err instanceof Error ? err.message : String(err)
       );
-
     } finally {
       loadingRef.current = false;
       setBusy(false);
+    }
+  };
+
+  // MARKET DATA
+
+  const loadMarkets = async () => {
+    if (marketLoadingRef.current) return;
+
+    marketLoadingRef.current = true;
+    setMarketLoading(true);
+    setMarketError("");
+
+    try {
+      const result = await api.markets();
+
+      setMarketItems(result.items || []);
+      setMarketServices(result.services || {});
+    } catch (err: unknown) {
+      setMarketError(
+        err instanceof Error ? err.message : String(err)
+      );
+    } finally {
+      marketLoadingRef.current = false;
+      setMarketLoading(false);
     }
   };
 
@@ -241,17 +314,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(
-      "sb-layers",
-      JSON.stringify(layers)
-    );
+    void loadMarkets();
+
+    const timer = window.setInterval(() => {
+      void loadMarkets();
+    }, 120000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // LOCAL SETTINGS
+
+  useEffect(() => {
+    localStorage.setItem("sb-layers", JSON.stringify(layers));
   }, [layers]);
 
   useEffect(() => {
-    localStorage.setItem(
-      "sb-theme",
-      JSON.stringify(theme)
-    );
+    localStorage.setItem("sb-theme", JSON.stringify(theme));
 
     Object.entries(theme).forEach(([key, value]) => {
       document.documentElement.style.setProperty(
@@ -260,6 +339,70 @@ export default function App() {
       );
     });
   }, [theme]);
+
+  // SATELLITE LAYER
+
+  function addSatelliteLayer(map: MapLibreMap) {
+    if (satelliteAdded.current) return;
+
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - 2);
+
+    const imageDate = date.toISOString().slice(0, 10);
+
+    const tileUrl =
+      `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/` +
+      `MODIS_Terra_CorrectedReflectance_TrueColor/default/` +
+      `${imageDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
+
+    try {
+      if (!map.getSource("sb-satellite")) {
+        map.addSource("sb-satellite", {
+          type: "raster",
+          tiles: [tileUrl],
+          tileSize: 256,
+          attribution: "NASA GIBS / NASA Earthdata"
+        });
+      }
+
+      if (!map.getLayer("sb-satellite-layer")) {
+        map.addLayer({
+          id: "sb-satellite-layer",
+          type: "raster",
+          source: "sb-satellite",
+          layout: {
+            visibility: "none"
+          },
+          paint: {
+            "raster-opacity": 0.9
+          }
+        });
+      }
+
+      satelliteAdded.current = true;
+    } catch (err) {
+      console.error("Satellite layer:", err);
+    }
+  }
+
+  function updateSatelliteVisibility(
+    map: MapLibreMap,
+    visible: boolean
+  ) {
+    if (!map.isStyleLoaded()) return;
+
+    if (!map.getLayer("sb-satellite-layer")) {
+      addSatelliteLayer(map);
+    }
+
+    if (map.getLayer("sb-satellite-layer")) {
+      map.setLayoutProperty(
+        "sb-satellite-layer",
+        "visibility",
+        visible ? "visible" : "none"
+      );
+    }
+  }
 
   // MAP INITIALIZATION
 
@@ -293,9 +436,23 @@ export default function App() {
     );
 
     map.on("load", () => {
+      setMapReady(true);
+      setMapError("");
+
       satelliteAdded.current = false;
       addSatelliteLayer(map);
       updateSatelliteVisibility(map, layers.satellite);
+    });
+
+    map.on("error", event => {
+      console.error("MapLibre error:", event.error);
+
+      if (!map.isStyleLoaded()) {
+        setMapReady(false);
+        setMapError(
+          event.error?.message || "Map style could not be loaded."
+        );
+      }
     });
 
     mapRef.current = map;
@@ -310,66 +467,6 @@ export default function App() {
     };
   }, []);
 
-function addSatelliteLayer(map: MapLibreMap) {
-  if (satelliteAdded.current) return;
-
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() - 2);
-
-  const imageDate = date.toISOString().slice(0, 10);
-
-  const tileUrl =
-    `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/` +
-    `MODIS_Terra_CorrectedReflectance_TrueColor/default/` +
-    `${imageDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
-
-  if (!map.getSource("sb-satellite")) {
-    map.addSource("sb-satellite", {
-      type: "raster",
-      tiles: [tileUrl],
-      tileSize: 256,
-      attribution: "NASA GIBS / NASA Earthdata"
-    });
-  }
-
-  if (!map.getLayer("sb-satellite-layer")) {
-    map.addLayer({
-      id: "sb-satellite-layer",
-      type: "raster",
-      source: "sb-satellite",
-      layout: {
-        visibility: "none"
-      },
-      paint: {
-        "raster-opacity": 0.9
-      }
-    });
-  }
-
-  satelliteAdded.current = true;
-}
-
-  function updateSatelliteVisibility(
-    map: MapLibreMap,
-    visible: boolean
-  ) {
-    if (!map.isStyleLoaded()) return;
-
-    if (!map.getLayer("sb-satellite-layer")) {
-      addSatelliteLayer(map);
-    }
-
-    if (map.getLayer("sb-satellite-layer")) {
-      map.setLayoutProperty(
-        "sb-satellite-layer",
-        "visibility",
-        visible ? "visible" : "none"
-      );
-    }
-  }
-
-  // SATELLITE LAYER
-
   useEffect(() => {
     const map = mapRef.current;
 
@@ -382,14 +479,14 @@ function addSatelliteLayer(map: MapLibreMap) {
         updateSatelliteVisibility(map, layers.satellite);
       });
     }
-  }, [layers.satellite]);
+  }, [layers.satellite, mapReady]);
 
-  // MARKERS
+  // MAP MARKERS
 
   useEffect(() => {
     const map = mapRef.current;
 
-    if (!map) return;
+    if (!map || !mapReady) return;
 
     markerRefs.current.forEach(marker => marker.remove());
     markerRefs.current = [];
@@ -404,7 +501,11 @@ function addSatelliteLayer(map: MapLibreMap) {
     ) => {
       if (
         !Number.isFinite(longitude) ||
-        !Number.isFinite(latitude)
+        !Number.isFinite(latitude) ||
+        longitude < -180 ||
+        longitude > 180 ||
+        latitude < -90 ||
+        latitude > 90
       ) return;
 
       const element = document.createElement("button");
@@ -413,6 +514,7 @@ function addSatelliteLayer(map: MapLibreMap) {
       element.style.setProperty("--marker-color", color);
       element.title = title;
       element.type = "button";
+      element.setAttribute("aria-label", title);
 
       const symbolElement = document.createElement("span");
       symbolElement.textContent = symbol;
@@ -471,6 +573,7 @@ function addSatelliteLayer(map: MapLibreMap) {
       });
     }
   }, [
+    mapReady,
     layers,
     quakes,
     flights,
@@ -482,7 +585,6 @@ function addSatelliteLayer(map: MapLibreMap) {
 
   const allNews = useMemo(() => {
     const combined = [...news, ...events];
-
     const unique = new Map<string, FeedItem>();
 
     combined.forEach(item => {
@@ -538,6 +640,26 @@ function addSatelliteLayer(map: MapLibreMap) {
     .sort((a, b) => b.time - a.time)
     .slice(0, 50), [quakes, events]);
 
+  // FILTERED MARKETS
+
+  const filteredMarkets = useMemo(() => {
+    if (marketFilter === "all") return marketItems;
+
+    return marketItems.filter(
+      item => item.category === marketFilter
+    );
+  }, [marketItems, marketFilter]);
+
+  const marketCounts = useMemo(() => ({
+    all: marketItems.length,
+    crypto: marketItems.filter(item => item.category === "crypto").length,
+    forex: marketItems.filter(item => item.category === "forex").length,
+    commodity: marketItems.filter(item => item.category === "commodity").length,
+    stock: marketItems.filter(item => item.category === "stock").length
+  }), [marketItems]);
+
+  // HELPERS
+
   const toggle = (key: keyof LayerState) => {
     setLayers(value => ({
       ...value,
@@ -548,8 +670,7 @@ function addSatelliteLayer(map: MapLibreMap) {
   const isFeed = (
     value: FeedItem | Earthquake | Flight | Vessel
   ): value is FeedItem =>
-    "source" in value &&
-    "url" in value;
+    "source" in value && "url" in value;
 
   const isVessel = (
     value: FeedItem | Earthquake | Flight | Vessel
@@ -566,9 +687,7 @@ function addSatelliteLayer(map: MapLibreMap) {
         category: newSourceCategory
       });
 
-      setSourceMessage(
-        `Added ${result.source.name}`
-      );
+      setSourceMessage(`Added ${result.source.name}`);
 
       setNewSourceName("");
       setNewSourceUrl("");
@@ -580,9 +699,7 @@ function addSatelliteLayer(map: MapLibreMap) {
 
     } catch (err: unknown) {
       setSourceMessage(
-        err instanceof Error
-          ? err.message
-          : String(err)
+        err instanceof Error ? err.message : String(err)
       );
     }
   };
@@ -598,22 +715,20 @@ function addSatelliteLayer(map: MapLibreMap) {
 
     } catch (err: unknown) {
       setSourceMessage(
-        err instanceof Error
-          ? err.message
-          : String(err)
+        err instanceof Error ? err.message : String(err)
       );
     }
   };
 
   const setColor = (
-  key: keyof typeof defaultTheme,
-  value: string
-) => {
-  setTheme((old: typeof defaultTheme) => ({
-    ...old,
-    [key]: value
-  }));
-};
+    key: keyof Theme,
+    value: string
+  ) => {
+    setTheme((old: Theme) => ({
+      ...old,
+      [key]: value
+    }));
+  };
 
   const setSatelliteMode = () => {
     setLayers(old => ({
@@ -621,6 +736,8 @@ function addSatelliteLayer(map: MapLibreMap) {
       satellite: !old.satellite
     }));
   };
+
+  // RENDER
 
   return (
     <div className="app-shell">
@@ -654,21 +771,22 @@ function addSatelliteLayer(map: MapLibreMap) {
         <nav className="main-navigation">
 
           <button
-            className="active"
+            className={activeTab === "news" ? "active" : ""}
             onClick={() => setActiveTab("news")}
           >
             <Globe2 size={15}/> WORLD
           </button>
 
           <button
+            className={activeTab === "sources" ? "active" : ""}
             onClick={() => setActiveTab("sources")}
           >
             <Newspaper size={15}/> NEWS
           </button>
 
           <button
-            disabled
-            title="Markets module is not implemented yet"
+            className={activeTab === "markets" ? "active" : ""}
+            onClick={() => setActiveTab("markets")}
           >
             <ChartNoAxesCombined size={15}/> MARKETS
           </button>
@@ -688,12 +806,15 @@ function addSatelliteLayer(map: MapLibreMap) {
 
           <button
             className="icon-button"
-            onClick={() => void load()}
+            onClick={() => {
+              void load();
+              void loadMarkets();
+            }}
             title="Refresh"
           >
             <RefreshCw
               size={17}
-              className={busy ? "spin" : ""}
+              className={busy || marketLoading ? "spin" : ""}
             />
           </button>
 
@@ -813,7 +934,7 @@ function addSatelliteLayer(map: MapLibreMap) {
           <div className="rail-foot">
             <span className="tiny-led"/>
             PUBLIC DATA
-            <span className="foot-right">v2.0.0</span>
+            <span className="foot-right">v2.1.0</span>
           </div>
 
         </aside>
@@ -840,11 +961,29 @@ function addSatelliteLayer(map: MapLibreMap) {
               className="map-canvas"
             />
 
+            {!mapReady && (
+              <div className="map-loading">
+                <RefreshCw size={20} className="spin"/>
+                <span>
+                  {mapError ? "MAP UNAVAILABLE" : "INITIALIZING MAP"}
+                </span>
+                {mapError && (
+                  <small>{mapError}</small>
+                )}
+              </div>
+            )}
+
+            {mapReady && mapError && (
+              <div className="map-error">
+                MAP WARNING: {mapError}
+              </div>
+            )}
+
             <div className="map-overlay map-overlay-top">
 
-              <span className="map-chip">
+              <span className={`map-chip ${mapReady ? "online" : "offline"}`}>
                 <span className="live-dot"/>
-                MAP ONLINE
+                {mapReady ? "MAP ONLINE" : "MAP OFFLINE"}
               </span>
 
               <span className="map-chip">
@@ -996,9 +1135,7 @@ function addSatelliteLayer(map: MapLibreMap) {
               onClick={() => setActiveTab("alerts")}
             >
               <Bell size={15}/> ALERTS
-              <span className="tab-count">
-                {alerts.length}
-              </span>
+              <span className="tab-count">{alerts.length}</span>
             </button>
 
             <button
@@ -1009,8 +1146,17 @@ function addSatelliteLayer(map: MapLibreMap) {
             </button>
 
             <button
+              className={activeTab === "markets" ? "active" : ""}
+              onClick={() => setActiveTab("markets")}
+              title="Markets"
+            >
+              <ChartNoAxesCombined size={15}/>
+            </button>
+
+            <button
               className={activeTab === "settings" ? "active" : ""}
               onClick={() => setActiveTab("settings")}
+              title="Settings"
             >
               <Settings2 size={15}/>
             </button>
@@ -1022,9 +1168,7 @@ function addSatelliteLayer(map: MapLibreMap) {
 
               <div className="panel-intro">
                 <div>
-                  <div className="eyebrow">
-                    GLOBAL NEWSWIRE
-                  </div>
+                  <div className="eyebrow">GLOBAL NEWSWIRE</div>
                   <h2>Latest reports</h2>
                 </div>
 
@@ -1038,17 +1182,13 @@ function addSatelliteLayer(map: MapLibreMap) {
 
                 <input
                   value={query}
-                  onChange={event =>
-                    setQuery(event.target.value)
-                  }
+                  onChange={event => setQuery(event.target.value)}
                   placeholder="Search headlines or sources"
                 />
               </div>
 
               {error && (
-                <div className="inline-warning">
-                  {error}
-                </div>
+                <div className="inline-warning">{error}</div>
               )}
 
               <div className="feed-list">
@@ -1068,7 +1208,6 @@ function addSatelliteLayer(map: MapLibreMap) {
                     </div>
 
                     <h3>{item.title}</h3>
-
                     <p>{item.summary}</p>
 
                     <div className="feed-time">
@@ -1093,9 +1232,7 @@ function addSatelliteLayer(map: MapLibreMap) {
 
               <div className="panel-intro">
                 <div>
-                  <div className="eyebrow">
-                    EVENT DETECTION
-                  </div>
+                  <div className="eyebrow">EVENT DETECTION</div>
                   <h2>Alert stream</h2>
                 </div>
 
@@ -1107,10 +1244,7 @@ function addSatelliteLayer(map: MapLibreMap) {
               <div className="feed-list">
 
                 {alerts.map(alert => (
-                  <div
-                    className="alert-item"
-                    key={alert.id}
-                  >
+                  <div className="alert-item" key={alert.id}>
                     <div className="alert-icon">
                       <Zap size={15}/>
                     </div>
@@ -1143,9 +1277,7 @@ function addSatelliteLayer(map: MapLibreMap) {
 
               <div className="panel-intro">
                 <div>
-                  <div className="eyebrow">
-                    CONNECTIVITY
-                  </div>
+                  <div className="eyebrow">CONNECTIVITY</div>
                   <h2>Data sources</h2>
                 </div>
               </div>
@@ -1154,18 +1286,13 @@ function addSatelliteLayer(map: MapLibreMap) {
 
                 {Object.entries(serviceStatus).map(
                   ([name, status]) => (
-                    <div
-                      className="source-row"
-                      key={name}
-                    >
+                    <div className="source-row" key={name}>
                       <div>
                         <strong>{name}</strong>
                         <p>{status.detail}</p>
                       </div>
 
-                      <span
-                        className={`source-state ${status.status}`}
-                      >
+                      <span className={`source-state ${status.status}`}>
                         {status.status.replaceAll("_", " ")}
                       </span>
                     </div>
@@ -1180,9 +1307,7 @@ function addSatelliteLayer(map: MapLibreMap) {
                 {sourceStatus.map(source => (
                   <p key={source.source}>
                     {source.source}: {source.status}
-                    {source.error
-                      ? ` — ${source.error}`
-                      : ""}
+                    {source.error ? ` — ${source.error}` : ""}
                   </p>
                 ))}
               </div>
@@ -1190,8 +1315,8 @@ function addSatelliteLayer(map: MapLibreMap) {
               <div className="source-note">
                 <strong>Data integrity</strong>
                 <p>
-                  Unavailable providers are not replaced
-                  with invented live positions.
+                  Unavailable providers are not replaced with
+                  invented live positions.
                 </p>
               </div>
 
@@ -1201,25 +1326,19 @@ function addSatelliteLayer(map: MapLibreMap) {
 
                 <input
                   value={newSourceName}
-                  onChange={event =>
-                    setNewSourceName(event.target.value)
-                  }
+                  onChange={event => setNewSourceName(event.target.value)}
                   placeholder="Agency name"
                 />
 
                 <input
                   value={newSourceUrl}
-                  onChange={event =>
-                    setNewSourceUrl(event.target.value)
-                  }
+                  onChange={event => setNewSourceUrl(event.target.value)}
                   placeholder="RSS / Atom URL"
                 />
 
                 <select
                   value={newSourceCategory}
-                  onChange={event =>
-                    setNewSourceCategory(event.target.value)
-                  }
+                  onChange={event => setNewSourceCategory(event.target.value)}
                 >
                   <option value="world">World</option>
                   <option value="conflict">Conflict</option>
@@ -1231,19 +1350,14 @@ function addSatelliteLayer(map: MapLibreMap) {
                 <button
                   className="primary-action"
                   onClick={() => void addNewsSource()}
-                  disabled={
-                    !newSourceName.trim() ||
-                    !newSourceUrl.trim()
-                  }
+                  disabled={!newSourceName.trim() || !newSourceUrl.trim()}
                 >
                   <Plus size={15}/>
                   Add source
                 </button>
 
                 {sourceMessage && (
-                  <p className="source-message">
-                    {sourceMessage}
-                  </p>
+                  <p className="source-message">{sourceMessage}</p>
                 )}
 
                 <h3>Custom sources</h3>
@@ -1251,16 +1365,11 @@ function addSatelliteLayer(map: MapLibreMap) {
                 {sources
                   .filter(source => source.custom)
                   .map(source => (
-                    <div
-                      className="custom-source"
-                      key={source.url}
-                    >
+                    <div className="custom-source" key={source.url}>
                       <span>{source.name}</span>
 
                       <button
-                        onClick={() =>
-                          void removeNewsSource(source.url)
-                        }
+                        onClick={() => void removeNewsSource(source.url)}
                         title="Remove source"
                       >
                         <Trash2 size={15}/>
@@ -1273,38 +1382,182 @@ function addSatelliteLayer(map: MapLibreMap) {
             </div>
           )}
 
+          {activeTab === "markets" && (
+            <div className="panel-content markets-panel">
+
+              <div className="panel-intro">
+                <div>
+                  <div className="eyebrow">GLOBAL FINANCIAL DATA</div>
+                  <h2>Market monitor</h2>
+                </div>
+
+                <button
+                  className="market-refresh"
+                  onClick={() => void loadMarkets()}
+                  title="Refresh market data"
+                >
+                  <RefreshCw
+                    size={16}
+                    className={marketLoading ? "spin" : ""}
+                  />
+                </button>
+              </div>
+
+              <div className="market-summary">
+                <div className="market-summary-icon">
+                  <ChartNoAxesCombined size={20}/>
+                </div>
+
+                <div>
+                  <strong>{marketItems.length}</strong>
+                  <span>MARKET INSTRUMENTS</span>
+                </div>
+
+                <div className="market-summary-status">
+                  <span className="live-dot"/>
+                  {marketLoading ? "UPDATING" : "DATA FEED"}
+                </div>
+              </div>
+
+              <div className="market-filters">
+                {marketFilters.map(filter => (
+                  <button
+                    key={filter.id}
+                    className={marketFilter === filter.id ? "active" : ""}
+                    onClick={() => setMarketFilter(filter.id)}
+                  >
+                    {filter.label}
+                    <span>{marketCounts[filter.id]}</span>
+                  </button>
+                ))}
+              </div>
+
+              {marketError && (
+                <div className="inline-warning">
+                  {marketError}
+                </div>
+              )}
+
+              <div className="market-list">
+
+                {filteredMarkets.map((item, index) => (
+                  <div
+                    className="market-item"
+                    key={`${item.symbol}-${index}`}
+                  >
+                    <div className="market-item-main">
+                      <div className={`market-icon ${item.category}`}>
+                        {item.category === "crypto" ? (
+                          <Coins size={17}/>
+                        ) : item.category === "forex" ? (
+                          <CircleDollarSign size={17}/>
+                        ) : (
+                          <TrendingUp size={17}/>
+                        )}
+                      </div>
+
+                      <div className="market-name">
+                        <strong>{item.symbol}</strong>
+                        <span>{item.name}</span>
+                      </div>
+                    </div>
+
+                    <div className="market-item-values">
+                      <strong>
+                        {formatPrice(item.price, item.currency)}
+                      </strong>
+
+                      <span
+                        className={
+                          item.change24h === undefined ||
+                          item.change24h === null
+                            ? ""
+                            : item.change24h >= 0
+                              ? "positive"
+                              : "negative"
+                        }
+                      >
+                        {item.change24h !== undefined &&
+                        item.change24h !== null ? (
+                          item.change24h >= 0
+                            ? <TrendingUp size={12}/>
+                            : <TrendingDown size={12}/>
+                        ) : null}
+
+                        {formatChange(item.change24h)}
+                      </span>
+                    </div>
+
+                    <div className="market-item-meta">
+                      <span>{item.category.toUpperCase()}</span>
+                      <span>{item.source}</span>
+                    </div>
+                  </div>
+                ))}
+
+                {!filteredMarkets.length && (
+                  <div className="empty-state">
+                    {marketLoading
+                      ? "Loading market data..."
+                      : "No market data available for this category."}
+                  </div>
+                )}
+
+              </div>
+
+              <div className="market-provider-list">
+                <div className="eyebrow">PROVIDER STATUS</div>
+
+                {Object.entries(marketServices).map(
+                  ([name, status]) => (
+                    <div className="market-provider" key={name}>
+                      <span>{name}</span>
+
+                      <span className={`source-state ${status.status}`}>
+                        {status.status.replaceAll("_", " ")}
+                      </span>
+                    </div>
+                  )
+                )}
+              </div>
+
+              <div className="source-note market-disclaimer">
+                <strong>Market data notes</strong>
+                <p>
+                  Cryptocurrency prices are sourced from Binance.
+                  Forex values are daily reference rates, not live
+                  trading quotes. Commodity availability depends on
+                  the configured provider.
+                </p>
+                <p>
+                  This dashboard displays market data and does not
+                  provide investment recommendations.
+                </p>
+              </div>
+
+            </div>
+          )}
+
           {activeTab === "settings" && (
             <div className="panel-content">
 
               <div className="panel-intro">
                 <div>
-                  <div className="eyebrow">
-                    INTERFACE CONTROL
-                  </div>
+                  <div className="eyebrow">INTERFACE CONTROL</div>
                   <h2>Appearance</h2>
                 </div>
               </div>
 
               <div className="theme-list">
 
-                {(
-                  Object.keys(defaultTheme) as
-                    (keyof typeof defaultTheme)[]
-                ).map(key => (
-                  <label
-                    className="theme-row"
-                    key={key}
-                  >
-                    <span>
-                      {key.replace(/([A-Z])/g, " $1")}
-                    </span>
+                {(Object.keys(defaultTheme) as (keyof Theme)[]).map(key => (
+                  <label className="theme-row" key={key}>
+                    <span>{key.replace(/([A-Z])/g, " $1")}</span>
 
                     <input
                       type="color"
                       value={theme[key]}
-                      onChange={event =>
-                        setColor(key, event.target.value)
-                      }
+                      onChange={event => setColor(key, event.target.value)}
                     />
                   </label>
                 ))}
@@ -1329,7 +1582,7 @@ function addSatelliteLayer(map: MapLibreMap) {
             <span className="tiny-led"/>
             PUBLIC DATA SOURCES
             <span>·</span>
-            {busy ? "UPDATING" : "MONITORING"}
+            {busy || marketLoading ? "UPDATING" : "MONITORING"}
           </div>
 
         </aside>
@@ -1347,22 +1600,18 @@ function addSatelliteLayer(map: MapLibreMap) {
           {tickerPaused ? " ▶" : " ❚❚"}
         </button>
 
-        <div
-          className={`ticker-track ${tickerPaused ? "paused" : ""}`}
-        >
+        <div className={`ticker-track ${tickerPaused ? "paused" : ""}`}>
           {tickerItems.length ? (
-            [...tickerItems, ...tickerItems].map(
-              (item, index) => (
-                <button
-                  className="ticker-item"
-                  key={`${item.id}-${index}`}
-                  onClick={() => setSelected(item)}
-                >
-                  <strong>{item.source}</strong>
-                  <span>{item.title}</span>
-                </button>
-              )
-            )
+            [...tickerItems, ...tickerItems].map((item, index) => (
+              <button
+                className="ticker-item"
+                key={`${item.id}-${index}`}
+                onClick={() => setSelected(item)}
+              >
+                <strong>{item.source}</strong>
+                <span>{item.title}</span>
+              </button>
+            ))
           ) : (
             <span className="ticker-empty">
               Waiting for news feeds...
@@ -1395,6 +1644,7 @@ function Layer({
     <button
       className="layer-row"
       onClick={onClick}
+      aria-pressed={checked}
     >
       <span className={`layer-icon ${color}`}>
         {icon}
