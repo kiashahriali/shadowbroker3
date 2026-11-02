@@ -1,35 +1,47 @@
-
 import type {
   Earthquake,
   FeedItem,
   Flight,
   Vessel,
   NewsSource,
-  ProviderStatus
+  ProviderStatus,
+  MarketAsset
 } from "./types";
 
 async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path, { cache: "no-store" });
+  const response = await fetch(path, {
+    cache: "no-store"
+  });
+
   const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(data.error || `HTTP ${response.status}`);
+    throw new Error(
+      data.error || `HTTP ${response.status}`
+    );
   }
 
   return data as T;
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
+async function post<T>(
+  path: string,
+  body: unknown
+): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(body)
   });
 
   const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(data.error || `HTTP ${response.status}`);
+    throw new Error(
+      data.error || `HTTP ${response.status}`
+    );
   }
 
   return data as T;
@@ -76,17 +88,19 @@ export const api = {
     }>("/api/vessels"),
 
   sources: () =>
-    get<{ items: NewsSource[] }>("/api/news/sources"),
+    get<{ items: NewsSource[] }>(
+      "/api/news/sources"
+    ),
 
   addSource: (source: {
     name: string;
     url: string;
     category: string;
   }) =>
-    post<{ ok: boolean; source: NewsSource }>(
-      "/api/news/sources",
-      source
-    ),
+    post<{
+      ok: boolean;
+      source: NewsSource;
+    }>("/api/news/sources", source),
 
   removeSource: (url: string) =>
     post<{ ok: boolean }>(
@@ -97,5 +111,11 @@ export const api = {
   status: () =>
     get<{
       services: Record<string, ProviderStatus>;
-    }>("/api/status")
+    }>("/api/status"),
+
+  markets: () =>
+    get<{
+      items: MarketAsset[];
+      services: Record<string, ProviderStatus>;
+    }>("/api/markets")
 };
