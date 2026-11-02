@@ -1,4 +1,3 @@
-
 export type NewsCategory =
   | "world"
   | "conflict"
@@ -35,7 +34,6 @@ export type Flight = {
   altitude: number | null;
   velocity: number | null;
   heading: number | null;
-  category?: string;
 };
 
 export type Vessel = {
@@ -70,4 +68,15 @@ export type NewsSource = {
   category: NewsCategory;
   enabled: boolean;
   custom?: boolean;
+};
+
+export type MarketAsset = {
+  symbol: string;
+  name: string;
+  category: "crypto" | "forex" | "commodity" | "stock";
+  price: number | null;
+  change24h?: number | null;
+  currency: string;
+  source: string;
+  updatedAt: string;
 };
