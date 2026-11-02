@@ -425,78 +425,99 @@ app.get("/api/earthquakes", async (_req, res) => {
 // { aircraft: [{ hex, flight, lat, lon, alt_baro, gs, track }] }
 // or { items: [...] } with normalized fields.
 
+// AIRCRAFT - ADSB.LOL
+
 app.get("/api/flights", async (_req, res) => {
-  const endpoint = process.env.ADSB_API_URL;
-
-  if (!endpoint) {
-    return res.json({
-      items: [],
-      status: "needs_credentials",
-      count: 0,
-      detail: "Configure ADSB_API_URL to enable aircraft tracking."
-    });
-  }
-
   try {
     const result = await cached("flights", async () => {
-      const url = validatePublicUrl(endpoint);
+      const regions = [
+        [40, -100],
+        [50, 10],
+        [30, 50],
+        [35, 110],
+        [-25, 135],
+        [-20, -60],
+        [0, 20],
+        [20, 120]
+      ];
 
-      const response = await fetch(url, {
-        headers: process.env.ADSB_API_KEY
-          ? { Authorization: `Bearer ${process.env.ADSB_API_KEY}` }
-          : {},
-        signal: AbortSignal.timeout(20000)
-      });
+      const responses = await Promise.allSettled(
+        regions.map(async ([lat, lon]) => {
+          const url =
+            `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/250`;
 
-      if (!response.ok) {
-        throw new Error(`Aircraft provider HTTP ${response.status}`);
-      }
+          const response = await fetch(url, {
+            headers: {
+              "User-Agent": "SHADOWBROKER/2.0"
+            },
+            signal: AbortSignal.timeout(15000)
+          });
 
-      const data: any = await response.json();
-      const rows = data.aircraft || data.items || data.states || [];
-
-      return rows
-        .map((item: any) => {
-          if (Array.isArray(item)) {
-            return {
-              icao24: item[0],
-              callsign: String(item[1] || "").trim(),
-              originCountry: item[2] || "",
-              longitude: item[5],
-              latitude: item[6],
-              altitude: item[7] ?? null,
-              velocity: item[9] ?? null,
-              heading: item[10] ?? null
-            };
+          if (!response.ok) {
+            throw new Error(
+              `ADSB.LOL HTTP ${response.status}`
+            );
           }
 
-          return {
-            icao24: item.icao24 || item.hex || item.icao || "",
-            callsign: String(
-              item.callsign || item.flight || ""
-            ).trim(),
-            originCountry: item.originCountry || item.ownOp || "",
-            longitude: Number(item.longitude ?? item.lon),
-            latitude: Number(item.latitude ?? item.lat),
-            altitude: item.altitude ?? item.alt_baro ?? null,
-            velocity: item.velocity ?? item.gs ?? null,
-            heading: item.heading ?? item.track ?? null
-          };
+          return response.json() as Promise<{
+            ac?: any[];
+          }>;
         })
-        .filter((item: any) =>
-          Number.isFinite(item.longitude) &&
-          Number.isFinite(item.latitude) &&
-          item.longitude >= -180 &&
-          item.longitude <= 180 &&
-          item.latitude >= -90 &&
-          item.latitude <= 90
-        );
+      );
+
+      const unique = new Map<string, Flight>();
+
+      for (const response of responses) {
+        if (response.status !== "fulfilled") {
+          continue;
+        }
+
+        for (const item of response.value.ac || []) {
+          const longitude = Number(item.lon);
+          const latitude = Number(item.lat);
+
+          if (
+            !Number.isFinite(longitude) ||
+            !Number.isFinite(latitude) ||
+            longitude < -180 ||
+            longitude > 180 ||
+            latitude < -90 ||
+            latitude > 90
+          ) {
+            continue;
+          }
+
+          const icao24 = String(item.hex || "").toLowerCase();
+
+          if (!icao24) continue;
+
+          unique.set(icao24, {
+            icao24,
+            callsign: String(item.flight || "").trim(),
+            originCountry: String(item.ownOp || ""),
+            longitude,
+            latitude,
+            altitude: Number.isFinite(Number(item.alt_baro))
+              ? Number(item.alt_baro)
+              : null,
+            velocity: Number.isFinite(Number(item.gs))
+              ? Number(item.gs)
+              : null,
+            heading: Number.isFinite(Number(item.track))
+              ? Number(item.track)
+              : null
+          });
+        }
+      }
+
+      return [...unique.values()];
     });
 
     res.json({
       items: result,
-      status: "online",
-      count: result.length
+      status: result.length ? "online" : "unavailable",
+      count: result.length,
+      detail: "ADSB.LOL public aircraft feed. Regional sampling."
     });
 
   } catch (error) {
