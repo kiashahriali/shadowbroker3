@@ -11,3 +11,185 @@
 .spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:1050px){.workspace{grid-template-columns:190px minmax(250px,1fr) 320px}.left-rail{padding-inline:10px}.map-section{padding-inline:12px}.top-status{display:none}}
 @media(max-width:760px){.app-shell{min-height:100dvh;height:100dvh}.topbar{height:58px;padding:0 12px;gap:10px}.mobile-only{display:grid}.brand{min-width:0}.brand-name{font-size:13px}.brand-sub{font-size:8px}.workspace{display:flex;flex-direction:column;overflow:hidden}.left-rail{display:none;position:absolute;z-index:8;top:58px;bottom:0;left:0;width:260px;box-shadow:12px 0 40px #0009}.left-rail.show{display:flex}.map-section{height:48%;min-height:270px;flex:none;padding:12px 10px 8px;gap:8px}.map-title h1{font-size:16px}.map-wrap{min-height:180px}.map-footer{gap:10px;flex-wrap:wrap;font-size:8px}.right-panel{flex:1;min-height:0;border-left:0;border-top:1px solid #1c2b37}.panel-tabs{height:45px}.panel-content{padding:12px 13px}.panel-intro h2{font-size:15px}.panel-bottom{height:30px}.map-coords{font-size:8px}.map-overlay-bottom{font-size:7px}.map-footer-right{display:none}}
+/* =====================================
+   SHADOWBROKER - MAP CENTRIC INTERFACE
+   ===================================== */
+
+.app-shell {
+  background: #070c12;
+}
+
+.workspace {
+  display: block;
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Full-screen map */
+.map-section {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  gap: 0;
+  z-index: 0;
+}
+
+.map-title,
+.map-footer {
+  display: none;
+}
+
+.map-wrap {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: #07111a;
+}
+
+.map-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+/* Map overlays */
+.map-overlay {
+  z-index: 2;
+}
+
+.map-chip {
+  background: #07121bc9;
+  border: 0;
+  border-radius: 3px;
+  backdrop-filter: blur(8px);
+}
+
+/* Floating left navigation */
+.left-rail {
+  position: absolute;
+  z-index: 4;
+  left: 14px;
+  top: 14px;
+  bottom: 14px;
+  width: 218px;
+  padding: 18px 12px;
+  background: #08131bd9;
+  backdrop-filter: blur(14px);
+  border: 0;
+  border-radius: 4px;
+  box-shadow: 0 8px 35px #0005;
+}
+
+/* Floating right panel */
+.right-panel {
+  position: absolute;
+  z-index: 4;
+  right: 14px;
+  top: 14px;
+  bottom: 14px;
+  width: 350px;
+  background: #08131bd9;
+  backdrop-filter: blur(14px);
+  border: 0;
+  border-radius: 4px;
+  box-shadow: 0 8px 35px #0005;
+}
+
+/* Remove card-like appearance */
+.layer-row,
+.map-controls button,
+.search-box,
+.source-note,
+.inspector {
+  border: 0;
+  border-radius: 3px;
+  background: #14232b99;
+}
+
+.panel-tabs {
+  border-bottom: 1px solid #ffffff16;
+}
+
+.panel-tabs button.active {
+  background: #142b3899;
+}
+
+.panel-content {
+  background: transparent;
+}
+
+.feed-item,
+.alert-item,
+.source-row {
+  border-bottom: 1px solid #ffffff13;
+}
+
+.feed-item:hover {
+  background: #ffffff08;
+}
+
+.inspector {
+  background: #07131beF;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 8px 35px #0008;
+}
+
+/* Header */
+.topbar {
+  position: relative;
+  z-index: 6;
+  background: #08111bd9;
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid #ffffff14;
+}
+
+/* Mobile */
+@media(max-width:760px) {
+  .map-section {
+    position: absolute;
+    inset: 0;
+    height: auto;
+    min-height: 0;
+    padding: 0;
+  }
+
+  .map-wrap {
+    position: absolute;
+    inset: 0;
+    min-height: 0;
+  }
+
+  .left-rail {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 260px;
+    border-radius: 0;
+    background: #08131bf2;
+  }
+
+  .right-panel {
+    position: absolute;
+    top: auto;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    width: auto;
+    height: 43%;
+    min-height: 220px;
+    border-radius: 4px;
+    background: #08131be8;
+  }
+
+  .map-overlay-bottom {
+    bottom: calc(43% + 22px);
+  }
+
+  .panel-content {
+    padding: 10px 13px;
+  }
+}
