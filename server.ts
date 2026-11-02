@@ -370,7 +370,219 @@ app.get("/api/events", async (_req, res) => {
     });
   }
 });
+// MARKETS
 
+app.get("/api/markets", async (_req, res) => {
+  const services: Record<string, {
+    status: string;
+    detail: string;
+  }> = {};
+
+  const items: any[] = [];
+
+  // CRYPTO - BINANCE PUBLIC MARKET DATA
+
+  try {
+    const symbols = [
+      "BTCUSDT",
+      "ETHUSDT",
+      "BNBUSDT",
+      "SOLUSDT",
+      "XRPUSDT",
+      "DOGEUSDT",
+      "ADAUSDT"
+    ];
+
+    const url =
+      "https://data-api.binance.vision/api/v3/ticker/24hr";
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(12000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Binance HTTP ${response.status}`);
+    }
+
+    const data: any[] = await response.json();
+
+    for (const symbol of symbols) {
+      const row = data.find(
+        item => item.symbol === symbol
+      );
+
+      if (!row) continue;
+
+      items.push({
+        symbol,
+        name: symbol.replace("USDT", ""),
+        category: "crypto",
+        price: Number(row.lastPrice),
+        change24h: Number(row.priceChangePercent),
+        currency: "USDT",
+        source: "Binance",
+        updatedAt: new Date().toISOString()
+      });
+    }
+
+    services.Binance = {
+      status: "online",
+      detail: "Public cryptocurrency market data."
+    };
+
+  } catch (error) {
+    services.Binance = {
+      status: "unavailable",
+      detail: errorText(error)
+    };
+  }
+
+  // FOREX - FRANKFURTER REFERENCE RATES
+
+  try {
+    const response = await fetch(
+      "https://api.frankfurter.dev/v2/rates?base=USD&quotes=EUR,GBP,JPY,CHF,CAD",
+      {
+        signal: AbortSignal.timeout(12000)
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Frankfurter HTTP ${response.status}`
+      );
+    }
+
+    const data: any[] = await response.json();
+
+    for (const row of data) {
+      items.push({
+        symbol: `USD/${row.quote}`,
+        name: `USD to ${row.quote}`,
+        category: "forex",
+        price: Number(row.rate),
+        currency: row.quote,
+        source: "Frankfurter",
+        updatedAt: row.date
+      });
+    }
+
+    services.Frankfurter = {
+      status: "online",
+      detail: "Daily reference exchange rates; not live trading quotes."
+    };
+
+  } catch (error) {
+    services.Frankfurter = {
+      status: "unavailable",
+      detail: errorText(error)
+    };
+  }
+
+  // OPTIONAL: GOLD API
+
+  try {
+    const response = await fetch(
+      "https://api.gold-api.com/price/XAU",
+      {
+        signal: AbortSignal.timeout(12000)
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Gold API HTTP ${response.status}`);
+    }
+
+    const data: any = await response.json();
+
+    const price = Number(data.price);
+
+    if (Number.isFinite(price)) {
+      items.push({
+        symbol: "XAU/USD",
+        name: "Gold",
+        category: "commodity",
+        price,
+        currency: "USD",
+        source: "Gold API",
+        updatedAt: data.updatedAt || new Date().toISOString()
+      });
+    }
+
+    services.Gold = {
+      status: "online",
+      detail: "Gold spot price from Gold API."
+    };
+
+  } catch (error) {
+    services.Gold = {
+      status: "unavailable",
+      detail: errorText(error)
+    };
+  }
+
+  // OIL - EIA API, OPTIONAL KEY
+
+  if (process.env.EIA_API_KEY) {
+    try {
+      const url = new URL(
+        "https://api.eia.gov/v2/petroleum/pri/spt/data/"
+      );
+
+      url.searchParams.set("api_key", process.env.EIA_API_KEY);
+      url.searchParams.set("frequency", "daily");
+      url.searchParams.set("data[0]", "value");
+      url.searchParams.set("facets[product][]", "EPCWTI");
+      url.searchParams.set("sort[0][column]", "period");
+      url.searchParams.set("sort[0][direction]", "desc");
+      url.searchParams.set("length", "1");
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(12000)
+      });
+
+      if (!response.ok) {
+        throw new Error(`EIA HTTP ${response.status}`);
+      }
+
+      const data: any = await response.json();
+      const row = data.response?.data?.[0];
+
+      if (row && Number.isFinite(Number(row.value))) {
+        items.push({
+          symbol: "WTI",
+          name: "WTI Crude Oil",
+          category: "commodity",
+          price: Number(row.value),
+          currency: "USD/barrel",
+          source: "EIA",
+          updatedAt: row.period
+        });
+      }
+
+      services.EIA = {
+        status: "online",
+        detail: "Daily WTI price from US EIA."
+      };
+
+    } catch (error) {
+      services.EIA = {
+        status: "unavailable",
+        detail: errorText(error)
+      };
+    }
+  } else {
+    services.EIA = {
+      status: "needs_credentials",
+      detail: "Set EIA_API_KEY in Render environment variables."
+    };
+  }
+
+  res.json({
+    items,
+    services
+  });
+});
 // EARTHQUAKES
 
 app.get("/api/earthquakes", async (_req, res) => {
