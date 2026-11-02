@@ -81,17 +81,27 @@ type Tab =
   | "sources"
   | "settings";
 
+type AlertItem = {
+  id: string;
+  title: string;
+  detail: string;
+  time: number;
+};
+
 export default function App() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const markerRefs = useRef<Marker[]>([]);
   const satelliteAdded = useRef(false);
+  const loadingRef = useRef(false);
 
   const [layers, setLayers] = useState<LayerState>(() => {
     try {
+      const saved = localStorage.getItem("sb-layers");
+
       return {
         ...initialLayers,
-        ...JSON.parse(localStorage.getItem("sb-layers") || "{}")
+        ...(saved ? JSON.parse(saved) : {})
       };
     } catch {
       return initialLayers;
@@ -100,9 +110,11 @@ export default function App() {
 
   const [theme, setTheme] = useState(() => {
     try {
+      const saved = localStorage.getItem("sb-theme");
+
       return {
         ...defaultTheme,
-        ...JSON.parse(localStorage.getItem("sb-theme") || "{}")
+        ...(saved ? JSON.parse(saved) : {})
       };
     } catch {
       return defaultTheme;
@@ -125,6 +137,7 @@ export default function App() {
   const [sources, setSources] = useState<NewsSource[]>([]);
 
   const [activeTab, setActiveTab] = useState<Tab>("news");
+
   const [selected, setSelected] = useState<
     FeedItem | Earthquake | Flight | Vessel | null
   >(null);
@@ -141,91 +154,107 @@ export default function App() {
     useState("world");
 
   const [sourceMessage, setSourceMessage] = useState("");
-
   const [tickerPaused, setTickerPaused] = useState(false);
 
-  const [mapStyle, setMapStyle] = useState<"dark" | "satellite">(
-    "dark"
-  );
-
   const load = async () => {
-    if (busy) return;
+    if (loadingRef.current) return;
 
+    loadingRef.current = true;
     setBusy(true);
     setError("");
 
-    const results = await Promise.allSettled([
-      api.news(),
-      api.events(),
-      api.earthquakes(),
-      api.flights(),
-      api.vessels(),
-      api.status(),
-      api.sources()
-    ]);
+    try {
+      const results = await Promise.allSettled([
+        api.news(),
+        api.events(),
+        api.earthquakes(),
+        api.flights(),
+        api.vessels(),
+        api.status(),
+        api.sources()
+      ]);
 
-    if (results[0].status === "fulfilled") {
-      setNews(results[0].value.items || []);
-      setSourceStatus(results[0].value.sourceStatus || []);
-    }
+      if (results[0].status === "fulfilled") {
+        setNews(results[0].value.items || []);
+        setSourceStatus(results[0].value.sourceStatus || []);
+      }
 
-    if (results[1].status === "fulfilled") {
-      setEvents(results[1].value.items || []);
-    }
+      if (results[1].status === "fulfilled") {
+        setEvents(results[1].value.items || []);
+      }
 
-    if (results[2].status === "fulfilled") {
-      setQuakes(results[2].value.items || []);
-    }
+      if (results[2].status === "fulfilled") {
+        setQuakes(results[2].value.items || []);
+      }
 
-    if (results[3].status === "fulfilled") {
-      setFlights(results[3].value.items || []);
-    }
+      if (results[3].status === "fulfilled") {
+        setFlights(results[3].value.items || []);
+      }
 
-    if (results[4].status === "fulfilled") {
-      setVessels(results[4].value.items || []);
-    }
+      if (results[4].status === "fulfilled") {
+        setVessels(results[4].value.items || []);
+      }
 
-    if (results[5].status === "fulfilled") {
-      setServiceStatus(results[5].value.services || {});
-    }
+      if (results[5].status === "fulfilled") {
+        setServiceStatus(results[5].value.services || {});
+      }
 
-    if (results[6].status === "fulfilled") {
-      setSources(results[6].value.items || []);
-    }
+      if (results[6].status === "fulfilled") {
+        setSources(results[6].value.items || []);
+      }
 
-    const rejected = results.filter(
-      result => result.status === "rejected"
-    );
-
-    if (rejected.length) {
-      setError(
-        "Some services are unavailable. Check Sources."
+      const rejected = results.filter(
+        result => result.status === "rejected"
       );
-    }
 
-    setLastUpdated(new Date());
-    setBusy(false);
+      if (rejected.length > 0) {
+        setError(
+          "Some services are unavailable. Check Sources."
+        );
+      }
+
+      setLastUpdated(new Date());
+
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : String(err)
+      );
+
+    } finally {
+      loadingRef.current = false;
+      setBusy(false);
+    }
   };
 
   useEffect(() => {
-    load();
+    void load();
 
-    const timer = window.setInterval(load, 120000);
+    const timer = window.setInterval(() => {
+      void load();
+    }, 120000);
 
     return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("sb-layers", JSON.stringify(layers));
+    localStorage.setItem(
+      "sb-layers",
+      JSON.stringify(layers)
+    );
   }, [layers]);
 
   useEffect(() => {
-    localStorage.setItem("sb-theme", JSON.stringify(theme));
+    localStorage.setItem(
+      "sb-theme",
+      JSON.stringify(theme)
+    );
 
     Object.entries(theme).forEach(([key, value]) => {
       document.documentElement.style.setProperty(
         `--sb-${key}`,
-        value
+        String(value)
       );
     });
   }, [theme]);
@@ -264,14 +293,18 @@ export default function App() {
     map.on("load", () => {
       satelliteAdded.current = false;
       addSatelliteLayer(map);
+      updateSatelliteVisibility(map, layers.satellite);
     });
 
     mapRef.current = map;
 
     return () => {
       markerRefs.current.forEach(marker => marker.remove());
+      markerRefs.current = [];
+
       map.remove();
       mapRef.current = null;
+      satelliteAdded.current = false;
     };
   }, []);
 
@@ -306,12 +339,11 @@ export default function App() {
     satelliteAdded.current = true;
   }
 
-  // SATELLITE LAYER
-
-  useEffect(() => {
-    const map = mapRef.current;
-
-    if (!map || !map.isStyleLoaded()) return;
+  function updateSatelliteVisibility(
+    map: MapLibreMap,
+    visible: boolean
+  ) {
+    if (!map.isStyleLoaded()) return;
 
     if (!map.getLayer("sb-satellite-layer")) {
       addSatelliteLayer(map);
@@ -321,8 +353,24 @@ export default function App() {
       map.setLayoutProperty(
         "sb-satellite-layer",
         "visibility",
-        layers.satellite ? "visible" : "none"
+        visible ? "visible" : "none"
       );
+    }
+  }
+
+  // SATELLITE LAYER
+
+  useEffect(() => {
+    const map = mapRef.current;
+
+    if (!map) return;
+
+    if (map.isStyleLoaded()) {
+      updateSatelliteVisibility(map, layers.satellite);
+    } else {
+      map.once("load", () => {
+        updateSatelliteVisibility(map, layers.satellite);
+      });
     }
   }, [layers.satellite]);
 
@@ -354,7 +402,11 @@ export default function App() {
       element.className = "map-marker";
       element.style.setProperty("--marker-color", color);
       element.title = title;
-      element.innerHTML = `<span>${symbol}</span>`;
+      element.type = "button";
+
+      const symbolElement = document.createElement("span");
+      symbolElement.textContent = symbol;
+      element.appendChild(symbolElement);
 
       element.addEventListener("click", () => {
         setSelected(item);
@@ -425,7 +477,10 @@ export default function App() {
 
     combined.forEach(item => {
       const key = item.url || item.title;
-      if (!unique.has(key)) unique.set(key, item);
+
+      if (!unique.has(key)) {
+        unique.set(key, item);
+      }
     });
 
     return [...unique.values()].sort((a, b) =>
@@ -451,7 +506,7 @@ export default function App() {
 
   // ALERTS
 
-  const alerts = useMemo(() => [
+  const alerts = useMemo<AlertItem[]>(() => [
     ...quakes
       .filter(quake => quake.magnitude >= 4.5)
       .map(quake => ({
@@ -481,16 +536,15 @@ export default function App() {
   };
 
   const isFeed = (
-    value: any
+    value: FeedItem | Earthquake | Flight | Vessel
   ): value is FeedItem =>
-    !!value &&
     "source" in value &&
     "url" in value;
 
   const isVessel = (
-    value: any
+    value: FeedItem | Earthquake | Flight | Vessel
   ): value is Vessel =>
-    !!value && "mmsi" in value;
+    "mmsi" in value;
 
   const addNewsSource = async () => {
     setSourceMessage("");
@@ -514,11 +568,11 @@ export default function App() {
 
       await load();
 
-    } catch (error) {
+    } catch (err: unknown) {
       setSourceMessage(
-        error instanceof Error
-          ? error.message
-          : "Could not add source."
+        err instanceof Error
+          ? err.message
+          : String(err)
       );
     }
   };
@@ -531,11 +585,12 @@ export default function App() {
       setSources(updated.items);
 
       await load();
-    } catch (error) {
+
+    } catch (err: unknown) {
       setSourceMessage(
-        error instanceof Error
-          ? error.message
-          : "Could not remove source."
+        err instanceof Error
+          ? err.message
+          : String(err)
       );
     }
   };
@@ -544,7 +599,7 @@ export default function App() {
     key: keyof typeof defaultTheme,
     value: string
   ) => {
-    setTheme((old: typeof defaultTheme) => ({
+    setTheme(old => ({
       ...old,
       [key]: value
     }));
@@ -587,6 +642,7 @@ export default function App() {
         </div>
 
         <nav className="main-navigation">
+
           <button
             className="active"
             onClick={() => setActiveTab("news")}
@@ -601,10 +657,12 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setActiveTab("alerts")}
+            disabled
+            title="Markets module is not implemented yet"
           >
             <ChartNoAxesCombined size={15}/> MARKETS
           </button>
+
         </nav>
 
         <div className="top-status">
@@ -620,7 +678,7 @@ export default function App() {
 
           <button
             className="icon-button"
-            onClick={load}
+            onClick={() => void load()}
             title="Refresh"
           >
             <RefreshCw
@@ -1162,8 +1220,11 @@ export default function App() {
 
                 <button
                   className="primary-action"
-                  onClick={addNewsSource}
-                  disabled={!newSourceName.trim() || !newSourceUrl.trim()}
+                  onClick={() => void addNewsSource()}
+                  disabled={
+                    !newSourceName.trim() ||
+                    !newSourceUrl.trim()
+                  }
                 >
                   <Plus size={15}/>
                   Add source
@@ -1188,7 +1249,7 @@ export default function App() {
 
                       <button
                         onClick={() =>
-                          removeNewsSource(source.url)
+                          void removeNewsSource(source.url)
                         }
                         title="Remove source"
                       >
