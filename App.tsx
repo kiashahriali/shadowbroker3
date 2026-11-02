@@ -48,7 +48,7 @@ export default function App() {
       container: mapNode.current,
       style: import.meta.env.VITE_MAP_STYLE || "https://tiles.openfreemap.org/styles/dark",
       center: [18, 22], zoom: 1.65, minZoom: 1.2, maxZoom: 12,
-      attributionControl: true
+      attributionControl: {}
     });
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
