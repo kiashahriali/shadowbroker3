@@ -6,9 +6,10 @@ import {
 } from "react";
 
 import maplibregl, {
-  Map as MapLibreMap,
-  Marker
+  Map as MapLibreMap
 } from "maplibre-gl";
+
+import "maplibre-gl/dist/maplibre-gl.css";
 
 import {
   Activity,
@@ -102,6 +103,8 @@ type AlertItem = {
 
 type Theme = typeof defaultTheme;
 
+type Entity = FeedItem | Earthquake | Flight | Vessel;
+
 const marketFilters: {
   id: MarketFilter;
   label: string;
@@ -129,12 +132,84 @@ function formatChange(value?: number | null) {
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
+// MAP ENTITY LAYERS (GeoJSON — replaces DOM markers)
+
+const ENTITY_LAYERS = [
+  { id: "quakes", radius: 6 },
+  { id: "vessels", radius: 4 },
+  { id: "flights", radius: 3.5 }
+] as const;
+
+type EntityLayerId = (typeof ENTITY_LAYERS)[number]["id"];
+
+const SATELLITE_LAYER = "sb-satellite-layer";
+
+/**
+ * Returns [lon, lat] or null when the position is unusable.
+ * Null / empty / NaN / out of range / (0,0) are all rejected so
+ * they can never pile up on a single point.
+ */
+const validCoord = (
+  lon: unknown,
+  lat: unknown
+): [number, number] | null => {
+  if (lon == null || lat == null || lon === "" || lat === "") return null;
+
+  const x = Number(lon);
+  const y = Number(lat);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (Math.abs(x) > 180 || Math.abs(y) > 90) return null;
+  if (x === 0 && y === 0) return null; // Null Island
+
+  return [x, y];
+};
+
+const emptyCollection = (): GeoJSON.FeatureCollection => ({
+  type: "FeatureCollection",
+  features: []
+});
+
+function ensureEntityLayers(map: MapLibreMap) {
+  ENTITY_LAYERS.forEach(({ id, radius }) => {
+    if (!map.getSource(`sb-${id}`)) {
+      map.addSource(`sb-${id}`, {
+        type: "geojson",
+        data: emptyCollection()
+      });
+    }
+
+    if (!map.getLayer(`sb-${id}-layer`)) {
+      map.addLayer({
+        id: `sb-${id}-layer`,
+        type: "circle",
+        source: `sb-${id}`,
+        paint: {
+          "circle-radius": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1,
+            radius,
+            8,
+            radius + 3
+          ],
+          "circle-color": "#53c7f4",
+          "circle-opacity": 0.88,
+          "circle-stroke-width": 1,
+          "circle-stroke-color": "#07111a"
+        }
+      });
+    }
+  });
+}
+
 export default function App() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
-  const markerRefs = useRef<Marker[]>([]);
   const satelliteAdded = useRef(false);
   const loadingRef = useRef(false);
+  const entityIndex = useRef<Record<string, Entity>>({});
 
   const [layers, setLayers] = useState<LayerState>(() => {
     try {
@@ -168,6 +243,12 @@ export default function App() {
   const [flights, setFlights] = useState<Flight[]>([]);
   const [vessels, setVessels] = useState<Vessel[]>([]);
 
+  const [flightInfo, setFlightInfo] = useState("");
+  const [vesselInfo, setVesselInfo] = useState("");
+
+  // Records the backend sent without a usable position
+  const [dropped, setDropped] = useState<Record<string, number>>({});
+
   const [serviceStatus, setServiceStatus] =
     useState<Record<string, ProviderStatus>>({});
 
@@ -189,9 +270,7 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<Tab>("news");
 
-  const [selected, setSelected] = useState<
-    FeedItem | Earthquake | Flight | Vessel | null
-  >(null);
+  const [selected, setSelected] = useState<Entity | null>(null);
 
   const [query, setQuery] = useState("");
   const [mobilePanel, setMobilePanel] = useState(false);
@@ -245,10 +324,16 @@ export default function App() {
 
       if (results[3].status === "fulfilled") {
         setFlights(results[3].value.items || []);
+        setFlightInfo(
+          results[3].value.detail || results[3].value.status || ""
+        );
       }
 
       if (results[4].status === "fulfilled") {
         setVessels(results[4].value.items || []);
+        setVesselInfo(
+          results[4].value.detail || results[4].value.status || ""
+        );
       }
 
       if (results[5].status === "fulfilled") {
@@ -259,12 +344,31 @@ export default function App() {
         setSources(results[6].value.items || []);
       }
 
-      const rejected = results.filter(
-        result => result.status === "rejected"
-      );
+      const names = [
+        "news",
+        "events",
+        "earthquakes",
+        "flights",
+        "vessels",
+        "status",
+        "sources"
+      ];
 
-      if (rejected.length > 0) {
-        setError("Some services are unavailable. Check Sources.");
+      const failures = results
+        .map((result, index) =>
+          result.status === "rejected"
+            ? `${names[index]}: ${
+                result.reason instanceof Error
+                  ? result.reason.message
+                  : String(result.reason)
+              }`
+            : null
+        )
+        .filter(Boolean) as string[];
+
+      if (failures.length > 0) {
+        console.warn("[load] failed:", failures);
+        setError(failures.join(" | "));
       }
 
       setLastUpdated(new Date());
@@ -361,22 +465,31 @@ export default function App() {
           type: "raster",
           tiles: [tileUrl],
           tileSize: 256,
+          maxzoom: 9,
           attribution: "NASA GIBS / NASA Earthdata"
         });
       }
 
-      if (!map.getLayer("sb-satellite-layer")) {
-        map.addLayer({
-          id: "sb-satellite-layer",
-          type: "raster",
-          source: "sb-satellite",
-          layout: {
-            visibility: "none"
+      if (!map.getLayer(SATELLITE_LAYER)) {
+        // Insert below the entity layers so markers always stay on top
+        const beforeId = map.getLayer("sb-quakes-layer")
+          ? "sb-quakes-layer"
+          : undefined;
+
+        map.addLayer(
+          {
+            id: SATELLITE_LAYER,
+            type: "raster",
+            source: "sb-satellite",
+            layout: {
+              visibility: "none"
+            },
+            paint: {
+              "raster-opacity": 0.9
+            }
           },
-          paint: {
-            "raster-opacity": 0.9
-          }
-        });
+          beforeId
+        );
       }
 
       satelliteAdded.current = true;
@@ -391,13 +504,13 @@ export default function App() {
   ) {
     if (!map.isStyleLoaded()) return;
 
-    if (!map.getLayer("sb-satellite-layer")) {
+    if (!map.getLayer(SATELLITE_LAYER)) {
       addSatelliteLayer(map);
     }
 
-    if (map.getLayer("sb-satellite-layer")) {
+    if (map.getLayer(SATELLITE_LAYER)) {
       map.setLayoutProperty(
-        "sb-satellite-layer",
+        SATELLITE_LAYER,
         "visibility",
         visible ? "visible" : "none"
       );
@@ -436,12 +549,33 @@ export default function App() {
     );
 
     map.on("load", () => {
-      setMapReady(true);
-      setMapError("");
+      // Entity layers first, then satellite beneath them
+      ensureEntityLayers(map);
 
       satelliteAdded.current = false;
       addSatelliteLayer(map);
-      updateSatelliteVisibility(map, layers.satellite);
+
+      ENTITY_LAYERS.forEach(({ id }) => {
+        const layerId = `sb-${id}-layer`;
+
+        map.on("click", layerId, event => {
+          const key = event.features?.[0]?.properties?.key;
+          const item = key ? entityIndex.current[key] : undefined;
+
+          if (item) setSelected(item);
+        });
+
+        map.on("mouseenter", layerId, () => {
+          map.getCanvas().style.cursor = "pointer";
+        });
+
+        map.on("mouseleave", layerId, () => {
+          map.getCanvas().style.cursor = "";
+        });
+      });
+
+      setMapError("");
+      setMapReady(true);
     });
 
     map.on("error", event => {
@@ -458,9 +592,6 @@ export default function App() {
     mapRef.current = map;
 
     return () => {
-      markerRefs.current.forEach(marker => marker.remove());
-      markerRefs.current = [];
-
       map.remove();
       mapRef.current = null;
       satelliteAdded.current = false;
@@ -470,116 +601,116 @@ export default function App() {
   useEffect(() => {
     const map = mapRef.current;
 
-    if (!map) return;
+    if (!map || !mapReady) return;
 
-    if (map.isStyleLoaded()) {
-      updateSatelliteVisibility(map, layers.satellite);
-    } else {
-      map.once("load", () => {
-        updateSatelliteVisibility(map, layers.satellite);
-      });
-    }
+    updateSatelliteVisibility(map, layers.satellite);
   }, [layers.satellite, mapReady]);
 
-  // MAP MARKERS
+  // MAP ENTITIES (flights / vessels / earthquakes)
 
   useEffect(() => {
     const map = mapRef.current;
 
     if (!map || !mapReady) return;
 
-    markerRefs.current.forEach(marker => marker.remove());
-    markerRefs.current = [];
+    ensureEntityLayers(map);
 
-    const addMarker = (
-      longitude: number,
-      latitude: number,
-      color: string,
-      title: string,
-      item: FeedItem | Earthquake | Flight | Vessel,
-      symbol = ""
-    ) => {
-      if (
-        !Number.isFinite(longitude) ||
-        !Number.isFinite(latitude) ||
-        longitude < -180 ||
-        longitude > 180 ||
-        latitude < -90 ||
-        latitude > 90
-      ) return;
+    const index: Record<string, Entity> = {};
+    const skipped: Record<string, number> = {};
 
-      const element = document.createElement("button");
+    const toCollection = <T,>(
+      prefix: EntityLayerId,
+      items: T[],
+      coords: (item: T) => [unknown, unknown]
+    ): GeoJSON.FeatureCollection => {
+      const features: GeoJSON.Feature[] = [];
 
-      element.className = "map-marker";
-      element.style.setProperty("--marker-color", color);
-      element.title = title;
-      element.type = "button";
-      element.setAttribute("aria-label", title);
+      items.forEach((item, i) => {
+        const c = validCoord(...coords(item));
 
-      const symbolElement = document.createElement("span");
-      symbolElement.textContent = symbol;
-      element.appendChild(symbolElement);
+        if (!c) {
+          skipped[prefix] = (skipped[prefix] || 0) + 1;
+          return;
+        }
 
-      element.addEventListener("click", () => {
-        setSelected(item);
+        const key = `${prefix}:${i}`;
+        index[key] = item as unknown as Entity;
+
+        features.push({
+          type: "Feature",
+          properties: { key },
+          geometry: {
+            type: "Point",
+            coordinates: c
+          }
+        });
       });
 
-      const marker = new maplibregl.Marker({
-        element,
-        anchor: "center"
-      })
-        .setLngLat([longitude, latitude])
-        .addTo(map);
-
-      markerRefs.current.push(marker);
+      return {
+        type: "FeatureCollection",
+        features
+      };
     };
 
-    if (layers.earthquakes) {
-      quakes.forEach(quake => {
-        addMarker(
-          quake.coordinates[0],
-          quake.coordinates[1],
-          theme.earthquakes,
-          quake.title,
-          quake,
-          "•"
-        );
-      });
-    }
+    const apply = (
+      id: EntityLayerId,
+      data: GeoJSON.FeatureCollection,
+      visible: boolean,
+      color: string
+    ) => {
+      const source = map.getSource(`sb-${id}`) as
+        | maplibregl.GeoJSONSource
+        | undefined;
 
-    if (layers.flights) {
-      flights.slice(0, 500).forEach(flight => {
-        addMarker(
-          flight.longitude,
-          flight.latitude,
-          theme.aircraft,
-          flight.callsign || flight.icao24,
-          flight,
-          "✈"
-        );
-      });
-    }
+      source?.setData(data);
 
-    if (layers.vessels) {
-      vessels.slice(0, 500).forEach(vessel => {
-        addMarker(
-          vessel.longitude,
-          vessel.latitude,
-          theme.vessels,
-          vessel.name,
-          vessel,
-          "◆"
-        );
-      });
-    }
-  }, [
-    mapReady,
-    layers,
-    quakes,
-    flights,
-    vessels,
-    theme
-  ]);
+      map.setLayoutProperty(
+        `sb-${id}-layer`,
+        "visibility",
+        visible ? "visible" : "none"
+      );
+
+      map.setPaintProperty(`sb-${id}-layer`, "circle-color", color);
+    };
+
+    apply(
+      "flights",
+      toCollection("flights", flights, f => [f.longitude, f.latitude]),
+      layers.flights,
+      theme.aircraft
+    );
+
+    apply(
+      "vessels",
+      toCollection("vessels", vessels, v => [v.longitude, v.latitude]),
+      layers.vessels,
+      theme.vessels
+    );
+
+    apply(
+      "quakes",
+      toCollection("quakes", quakes, q => [
+        q.coordinates?.[0],
+        q.coordinates?.[1]
+      ]),
+      layers.earthquakes,
+      theme.earthquakes
+    );
+
+    entityIndex.current = index;
+    setDropped(skipped);
+
+    console.debug(
+      "[map] records without valid position:",
+      skipped,
+      "| raw counts:",
+      {
+        flights: flights.length,
+        vessels: vessels.length,
+        quakes: quakes.length
+      }
+    );
+  }, [mapReady, layers, quakes, flights, vessels, theme]);
 
   // NEWS
 
@@ -667,14 +798,10 @@ export default function App() {
     }));
   };
 
-  const isFeed = (
-    value: FeedItem | Earthquake | Flight | Vessel
-  ): value is FeedItem =>
+  const isFeed = (value: Entity): value is FeedItem =>
     "source" in value && "url" in value;
 
-  const isVessel = (
-    value: FeedItem | Earthquake | Flight | Vessel
-  ): value is Vessel =>
+  const isVessel = (value: Entity): value is Vessel =>
     "mmsi" in value;
 
   const addNewsSource = async () => {
@@ -737,6 +864,19 @@ export default function App() {
     }));
   };
 
+  const layerDetail = (
+    count: number,
+    word: string,
+    info: string,
+    skipped?: number
+  ) => {
+    if (!count) return info || "no data";
+
+    return skipped
+      ? `${count} ${word} · ${skipped} no position`
+      : `${count} ${word}`;
+  };
+
   // RENDER
 
   return (
@@ -781,7 +921,7 @@ export default function App() {
             className={activeTab === "sources" ? "active" : ""}
             onClick={() => setActiveTab("sources")}
           >
-            <Newspaper size={15}/> NEWS
+            <Newspaper size={15}/> SOURCES
           </button>
 
           <button
@@ -843,7 +983,12 @@ export default function App() {
             <Layer
               icon={<Plane size={16}/>}
               name="Aircraft"
-              detail={`${flights.length} tracked`}
+              detail={layerDetail(
+                flights.length,
+                "tracked",
+                flightInfo,
+                dropped.flights
+              )}
               checked={layers.flights}
               onClick={() => toggle("flights")}
               color="blue"
@@ -879,7 +1024,12 @@ export default function App() {
             <Layer
               icon={<Anchor size={16}/>}
               name="Maritime / AIS"
-              detail={`${vessels.length} vessels`}
+              detail={layerDetail(
+                vessels.length,
+                "vessels",
+                vesselInfo,
+                dropped.vessels
+              )}
               checked={layers.vessels}
               onClick={() => toggle("vessels")}
               color="cyan"
@@ -995,11 +1145,11 @@ export default function App() {
             </div>
 
             <div className="map-overlay map-overlay-bottom">
-              <span>SELECT A MARKER TO INSPECT</span>
+              <span>SELECT A POINT TO INSPECT</span>
 
               <span>
-                {flights.length} AIRCRAFT ·
-                {vessels.length} VESSELS ·
+                {flights.length} AIRCRAFT ·{" "}
+                {vessels.length} VESSELS ·{" "}
                 {quakes.length} SEISMIC EVENTS
               </span>
             </div>
@@ -1024,7 +1174,7 @@ export default function App() {
                     <p>{selected.summary}</p>
 
                     <div className="inspector-meta">
-                      {selected.source} ·
+                      {selected.source} ·{" "}
                       {timeLabel(selected.publishedAt)}
                     </div>
 
@@ -1042,7 +1192,7 @@ export default function App() {
                     <p>{selected.place}</p>
 
                     <div className="inspector-meta">
-                      Magnitude {selected.magnitude} ·
+                      Magnitude {selected.magnitude} ·{" "}
                       {timeLabel(
                         new Date(selected.time).toISOString()
                       )}
@@ -1062,7 +1212,7 @@ export default function App() {
                     <p>MMSI: {selected.mmsi}</p>
 
                     <div className="inspector-meta">
-                      Speed: {selected.speed ?? "—"} knots ·
+                      Speed: {selected.speed ?? "—"} knots ·{" "}
                       Heading: {selected.heading ?? "—"}
                     </div>
                   </>
@@ -1075,7 +1225,7 @@ export default function App() {
                     <p>{selected.originCountry}</p>
 
                     <div className="inspector-meta">
-                      Altitude {selected.altitude ?? "—"} m ·
+                      Altitude {selected.altitude ?? "—"} m ·{" "}
                       Speed {selected.velocity ?? "—"} m/s
                     </div>
                   </>
@@ -1282,6 +1432,10 @@ export default function App() {
                 </div>
               </div>
 
+              {error && (
+                <div className="inline-warning">{error}</div>
+              )}
+
               <div className="source-list">
 
                 {Object.entries(serviceStatus).map(
@@ -1299,6 +1453,26 @@ export default function App() {
                   )
                 )}
 
+              </div>
+
+              <div className="source-note">
+                <strong>Live layer diagnostics</strong>
+
+                <p>
+                  Aircraft: {flights.length} received
+                  {dropped.flights
+                    ? `, ${dropped.flights} without valid position`
+                    : ""}
+                  {flightInfo ? ` — ${flightInfo}` : ""}
+                </p>
+
+                <p>
+                  Vessels: {vessels.length} received
+                  {dropped.vessels
+                    ? `, ${dropped.vessels} without valid position`
+                    : ""}
+                  {vesselInfo ? ` — ${vesselInfo}` : ""}
+                </p>
               </div>
 
               <div className="source-note">
@@ -1600,18 +1774,25 @@ export default function App() {
           {tickerPaused ? " ▶" : " ❚❚"}
         </button>
 
-        <div className={`ticker-track ${tickerPaused ? "paused" : ""}`}>
+        <div className="ticker-viewport">
           {tickerItems.length ? (
-            [...tickerItems, ...tickerItems].map((item, index) => (
-              <button
-                className="ticker-item"
-                key={`${item.id}-${index}`}
-                onClick={() => setSelected(item)}
-              >
-                <strong>{item.source}</strong>
-                <span>{item.title}</span>
-              </button>
-            ))
+            <div
+              className={`ticker-track ${tickerPaused ? "paused" : ""}`}
+              style={{
+                animationDuration: `${Math.max(40, tickerItems.length * 7)}s`
+              }}
+            >
+              {[...tickerItems, ...tickerItems].map((item, index) => (
+                <button
+                  className="ticker-item"
+                  key={`${item.id}-${index}`}
+                  onClick={() => setSelected(item)}
+                >
+                  <strong>{item.source}</strong>
+                  <span>{item.title}</span>
+                </button>
+              ))}
+            </div>
           ) : (
             <span className="ticker-empty">
               Waiting for news feeds...
