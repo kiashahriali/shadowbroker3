@@ -3,18 +3,20 @@ import express from "express";
 import cors from "cors";
 import Parser from "rss-parser";
 import { resolve } from "node:path";
+import { isIP } from "node:net";
 import { RSS_SOURCES } from "./sources";
+import type { NewsSource } from "./types";
 
 const app = express();
 const parser = new Parser({
   timeout: 15000,
   headers: {
-    "User-Agent": "SHADOWBROKER/1.0 public-data-dashboard"
+    "User-Agent": "SHADOWBROKER/2.0"
   }
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 const PORT = Number(process.env.PORT || 8787);
 const cache = new Map<string, {
@@ -22,26 +24,28 @@ const cache = new Map<string, {
   data: unknown;
 }>();
 
-const TTL = 120000;
+const CACHE_TTL = 120000;
+
+let customSources: NewsSource[] = [];
 
 async function cached<T>(
   key: string,
   fn: () => Promise<T>
 ): Promise<T> {
-  const current = cache.get(key);
+  const old = cache.get(key);
 
-  if (current && current.expires > Date.now()) {
-    return current.data as T;
+  if (old && old.expires > Date.now()) {
+    return old.data as T;
   }
 
-  const value = await fn();
+  const data = await fn();
 
   cache.set(key, {
-    expires: Date.now() + TTL,
-    data: value
+    expires: Date.now() + CACHE_TTL,
+    data
   });
 
-  return value;
+  return data;
 }
 
 function cleanText(value = "") {
@@ -52,32 +56,81 @@ function cleanText(value = "") {
     .slice(0, 500);
 }
 
-function errorMessage(error: unknown) {
+function errorText(error: unknown) {
   if (error instanceof Error) {
     const cause = (error as any).cause;
-    return [
-      error.name,
-      error.message,
-      cause ? String(cause) : ""
-    ].filter(Boolean).join(" | ");
+    return `${error.name}: ${error.message}${
+      cause ? " | " + String(cause) : ""
+    }`;
   }
 
   return String(error);
 }
 
-async function fetchJson(url: string, timeout = 20000) {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "SHADOWBROKER/1.0"
-    },
-    signal: AbortSignal.timeout(timeout)
-  });
+function isPrivateIPv4(ip: string) {
+  const parts = ip.split(".").map(Number);
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  if (parts.length !== 4 || parts.some(n => n < 0 || n > 255)) {
+    return true;
   }
 
-  return response.json();
+  const [a, b] = parts;
+
+  return (
+    a === 10 ||
+    a === 127 ||
+    a === 0 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+function validatePublicUrl(value: string) {
+  const url = new URL(value);
+
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Only HTTP and HTTPS URLs are allowed.");
+  }
+
+  if (
+    url.hostname === "localhost" ||
+    url.hostname.endsWith(".localhost") ||
+    url.hostname.endsWith(".local")
+  ) {
+    throw new Error("Private network URLs are not allowed.");
+  }
+
+  if (isIP(url.hostname) === 4 && isPrivateIPv4(url.hostname)) {
+    throw new Error("Private IP addresses are not allowed.");
+  }
+
+  if (isIP(url.hostname) === 6) {
+    const ip = url.hostname.toLowerCase();
+
+    if (
+      ip === "::1" ||
+      ip === "::" ||
+      ip.startsWith("fc") ||
+      ip.startsWith("fd") ||
+      ip.startsWith("fe80:")
+    ) {
+      throw new Error("Private IP addresses are not allowed.");
+    }
+  }
+
+  return url.toString();
+}
+
+function allSources() {
+  return [
+    ...RSS_SOURCES,
+    ...customSources
+  ].filter(source => source.enabled);
+}
+
+function invalidate(key: string) {
+  cache.delete(key);
 }
 
 // HEALTH
@@ -85,9 +138,87 @@ async function fetchJson(url: string, timeout = 20000) {
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    service: "SHADOWBROKER API",
+    service: "SHADOWBROKER",
     timestamp: new Date().toISOString()
   });
+});
+
+// NEWS SOURCE MANAGEMENT
+
+app.get("/api/news/sources", (_req, res) => {
+  res.json({
+    items: allSources()
+  });
+});
+
+app.post("/api/news/sources", (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim();
+    const url = validatePublicUrl(String(req.body.url || ""));
+    const category = String(req.body.category || "world");
+
+    const allowedCategories = [
+      "world",
+      "conflict",
+      "protest",
+      "technology",
+      "finance"
+    ];
+
+    if (!name || name.length > 80) {
+      return res.status(400).json({
+        error: "Source name must contain 1-80 characters."
+      });
+    }
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        error: "Invalid category."
+      });
+    }
+
+    if (
+      [...RSS_SOURCES, ...customSources]
+        .some(source => source.url === url)
+    ) {
+      return res.status(409).json({
+        error: "This source already exists."
+      });
+    }
+
+    const source: NewsSource = {
+      name,
+      url,
+      category: category as NewsSource["category"],
+      enabled: true,
+      custom: true
+    };
+
+    customSources.push(source);
+    invalidate("news");
+
+    res.json({
+      ok: true,
+      source
+    });
+
+  } catch (error) {
+    res.status(400).json({
+      error: errorText(error)
+    });
+  }
+});
+
+app.post("/api/news/sources/remove", (req, res) => {
+  const url = String(req.body.url || "");
+
+  customSources = customSources.filter(
+    source => source.url !== url
+  );
+
+  invalidate("news");
+
+  res.json({ ok: true });
 });
 
 // NEWS
@@ -95,14 +226,16 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/news", async (_req, res) => {
   try {
     const result = await cached("news", async () => {
+      const sources = allSources();
+
       const feeds = await Promise.allSettled(
-        RSS_SOURCES.map(async source => {
+        sources.map(async source => {
           const feed = await parser.parseURL(source.url);
 
           const items = (feed.items || [])
-            .slice(0, 18)
-            .map(item => ({
-              id: `${source.name}-${item.guid || item.link || item.title}`,
+            .slice(0, 30)
+            .map((item, index) => ({
+              id: `${source.name}-${item.guid || item.link || index}`,
               title: cleanText(item.title || "Untitled report"),
               source: source.name,
               url: item.link || "",
@@ -121,19 +254,26 @@ app.get("/api/news", async (_req, res) => {
       );
 
       const items = feeds.flatMap(feed =>
-        feed.status === "fulfilled" ? feed.value.items : []
+        feed.status === "fulfilled"
+          ? feed.value.items
+          : []
       );
 
       const sourceStatus = feeds.map((feed, index) => ({
-        source: RSS_SOURCES[index].name,
-        status: feed.status === "fulfilled" ? "online" : "offline",
+        source: sources[index].name,
+        status: feed.status === "fulfilled"
+          ? "online"
+          : "offline",
         error: feed.status === "rejected"
-          ? errorMessage(feed.reason)
+          ? errorText(feed.reason)
           : undefined
       }));
 
       return {
-        items,
+        items: items.sort((a, b) =>
+          new Date(b.publishedAt || 0).getTime() -
+          new Date(a.publishedAt || 0).getTime()
+        ),
         sourceStatus,
         status: items.length > 0
           ? "online"
@@ -144,12 +284,89 @@ app.get("/api/news", async (_req, res) => {
     res.json(result);
 
   } catch (error) {
-    console.error("NEWS ERROR:", error);
+    console.error("NEWS:", error);
+
+    res.status(502).json({
+      items: [],
+      sourceStatus: [],
+      status: "unavailable",
+      error: errorText(error)
+    });
+  }
+});
+
+// GDELT
+
+app.get("/api/events", async (_req, res) => {
+  try {
+    const result = await cached("events", async () => {
+      const queries = [
+        {
+          category: "conflict",
+          query: "war OR military attack OR armed conflict"
+        },
+        {
+          category: "protest",
+          query: "protest OR demonstration OR civil unrest"
+        }
+      ];
+
+      const responses = await Promise.allSettled(
+        queries.map(async item => {
+          const params = new URLSearchParams({
+            query: item.query,
+            mode: "ArtList",
+            format: "json",
+            maxrecords: "50",
+            sort: "DateDesc"
+          });
+
+          const response = await fetch(
+            `https://api.gdeltproject.org/api/v2/doc/doc?${params}`,
+            {
+              signal: AbortSignal.timeout(15000)
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`GDELT HTTP ${response.status}`);
+          }
+
+          const data: any = await response.json();
+
+          return (data.articles || []).map((article: any, index: number) => ({
+            id: `${item.category}-${article.url || index}`,
+            title: cleanText(article.title || "Untitled event"),
+            source: article.domain || "GDELT",
+            url: article.url || "",
+            publishedAt: article.seendate
+              ? `${article.seendate.slice(0, 4)}-${article.seendate.slice(4, 6)}-${article.seendate.slice(6, 8)}T${article.seendate.slice(9, 11)}:${article.seendate.slice(11, 13)}:${article.seendate.slice(13, 15)}Z`
+              : undefined,
+            summary: "",
+            category: item.category
+          }));
+        })
+      );
+
+      return responses.flatMap(result =>
+        result.status === "fulfilled"
+          ? result.value
+          : []
+      );
+    });
+
+    res.json({
+      items: result,
+      status: result.length ? "online" : "unavailable"
+    });
+
+  } catch (error) {
+    console.error("GDELT:", error);
 
     res.status(502).json({
       items: [],
       status: "unavailable",
-      error: errorMessage(error)
+      error: errorText(error)
     });
   }
 });
@@ -159,21 +376,30 @@ app.get("/api/news", async (_req, res) => {
 app.get("/api/earthquakes", async (_req, res) => {
   try {
     const items = await cached("earthquakes", async () => {
-      const geo: any = await fetchJson(
-        "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
+      const response = await fetch(
+        "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
+        {
+          signal: AbortSignal.timeout(15000)
+        }
       );
 
-      return (geo.features || []).map((f: any) => ({
-        id: f.id,
-        title: f.properties.title,
-        place: f.properties.place,
-        magnitude: f.properties.mag,
-        time: f.properties.time,
+      if (!response.ok) {
+        throw new Error(`USGS HTTP ${response.status}`);
+      }
+
+      const geo: any = await response.json();
+
+      return (geo.features || []).map((feature: any) => ({
+        id: feature.id,
+        title: feature.properties.title,
+        place: feature.properties.place,
+        magnitude: feature.properties.mag,
+        time: feature.properties.time,
         coordinates: [
-          f.geometry.coordinates[0],
-          f.geometry.coordinates[1]
+          feature.geometry.coordinates[0],
+          feature.geometry.coordinates[1]
         ],
-        url: f.properties.url
+        url: feature.properties.url
       }));
     });
 
@@ -183,119 +409,219 @@ app.get("/api/earthquakes", async (_req, res) => {
     });
 
   } catch (error) {
-    console.error("USGS ERROR:", error);
+    console.error("USGS:", error);
 
     res.status(502).json({
       items: [],
       status: "unavailable",
-      error: errorMessage(error)
+      error: errorText(error)
     });
   }
 });
 
-// AIRCRAFT
+// AIRCRAFT PROVIDER
+// ADSB_API_URL must return JSON with an aircraft array.
+// Supported formats:
+// { aircraft: [{ hex, flight, lat, lon, alt_baro, gs, track }] }
+// or { items: [...] } with normalized fields.
 
 app.get("/api/flights", async (_req, res) => {
+  const endpoint = process.env.ADSB_API_URL;
+
+  if (!endpoint) {
+    return res.json({
+      items: [],
+      status: "needs_credentials",
+      count: 0,
+      detail: "Configure ADSB_API_URL to enable aircraft tracking."
+    });
+  }
+
   try {
-    const items = await cached("flights", async () => {
-      const headers: Record<string, string> = {};
+    const result = await cached("flights", async () => {
+      const url = validatePublicUrl(endpoint);
 
-      const username = process.env.OPENSKY_USERNAME;
-      const password = process.env.OPENSKY_PASSWORD;
-
-      if (username && password) {
-        headers.Authorization =
-          "Basic " +
-          Buffer.from(`${username}:${password}`).toString("base64");
-      }
-
-      const response = await fetch(
-        "https://opensky-network.org/api/states/all",
-        {
-          headers,
-          signal: AbortSignal.timeout(20000)
-        }
-      );
+      const response = await fetch(url, {
+        headers: process.env.ADSB_API_KEY
+          ? { Authorization: `Bearer ${process.env.ADSB_API_KEY}` }
+          : {},
+        signal: AbortSignal.timeout(20000)
+      });
 
       if (!response.ok) {
-        throw new Error(
-          `OpenSky HTTP ${response.status}: ${response.statusText}`
-        );
+        throw new Error(`Aircraft provider HTTP ${response.status}`);
       }
 
       const data: any = await response.json();
+      const rows = data.aircraft || data.items || data.states || [];
 
-      return (data.states || [])
-        .filter((s: any[]) =>
-          s[5] !== null &&
-          s[6] !== null &&
-          Number.isFinite(s[5]) &&
-          Number.isFinite(s[6]) &&
-          s[5] >= -180 &&
-          s[5] <= 180 &&
-          s[6] >= -90 &&
-          s[6] <= 90
-        )
-        .map((s: any[]) => ({
-          icao24: s[0],
-          callsign: String(s[1] || "").trim(),
-          originCountry: s[2],
-          longitude: s[5],
-          latitude: s[6],
-          altitude: s[7],
-          velocity: s[9],
-          heading: s[10]
-        }));
+      return rows
+        .map((item: any) => {
+          if (Array.isArray(item)) {
+            return {
+              icao24: item[0],
+              callsign: String(item[1] || "").trim(),
+              originCountry: item[2] || "",
+              longitude: item[5],
+              latitude: item[6],
+              altitude: item[7] ?? null,
+              velocity: item[9] ?? null,
+              heading: item[10] ?? null
+            };
+          }
+
+          return {
+            icao24: item.icao24 || item.hex || item.icao || "",
+            callsign: String(
+              item.callsign || item.flight || ""
+            ).trim(),
+            originCountry: item.originCountry || item.ownOp || "",
+            longitude: Number(item.longitude ?? item.lon),
+            latitude: Number(item.latitude ?? item.lat),
+            altitude: item.altitude ?? item.alt_baro ?? null,
+            velocity: item.velocity ?? item.gs ?? null,
+            heading: item.heading ?? item.track ?? null
+          };
+        })
+        .filter((item: any) =>
+          Number.isFinite(item.longitude) &&
+          Number.isFinite(item.latitude) &&
+          item.longitude >= -180 &&
+          item.longitude <= 180 &&
+          item.latitude >= -90 &&
+          item.latitude <= 90
+        );
     });
 
     res.json({
-      items,
+      items: result,
       status: "online",
-      count: items.length
+      count: result.length
     });
 
   } catch (error) {
-    console.error("OPENSKY ERROR:", error);
+    console.error("AIRCRAFT:", error);
 
     res.status(502).json({
       items: [],
       status: "unavailable",
-      error: errorMessage(error)
+      count: 0,
+      error: errorText(error)
     });
   }
 });
 
-// SERVICE STATUS
+// MARITIME PROVIDER
+// AIS_API_URL must return { items: [...] } or { vessels: [...] }.
 
-app.get("/api/status", async (_req, res) => {
-  const services = {
-    "BBC / Guardian / Al Jazeera / DW RSS": {
+app.get("/api/vessels", async (_req, res) => {
+  const endpoint = process.env.AIS_API_URL;
+
+  if (!endpoint) {
+    return res.json({
+      items: [],
+      status: "needs_credentials",
+      count: 0,
+      detail: "Configure AIS_API_URL to enable vessel tracking."
+    });
+  }
+
+  try {
+    const result = await cached("vessels", async () => {
+      const url = validatePublicUrl(endpoint);
+
+      const response = await fetch(url, {
+        headers: process.env.AIS_API_KEY
+          ? { Authorization: `Bearer ${process.env.AIS_API_KEY}` }
+          : {},
+        signal: AbortSignal.timeout(20000)
+      });
+
+      if (!response.ok) {
+        throw new Error(`AIS provider HTTP ${response.status}`);
+      }
+
+      const data: any = await response.json();
+      const rows = data.vessels || data.items || [];
+
+      return rows
+        .map((item: any) => ({
+          mmsi: String(item.mmsi || item.MMSI || ""),
+          name: item.name || item.shipname || "Unknown vessel",
+          longitude: Number(item.longitude ?? item.lon),
+          latitude: Number(item.latitude ?? item.lat),
+          speed: item.speed ?? item.sog ?? null,
+          heading: item.heading ?? item.cog ?? null,
+          destination: item.destination || "",
+          vesselType: item.vesselType || item.ship_type || ""
+        }))
+        .filter((item: any) =>
+          Number.isFinite(item.longitude) &&
+          Number.isFinite(item.latitude) &&
+          item.longitude >= -180 &&
+          item.longitude <= 180 &&
+          item.latitude >= -90 &&
+          item.latitude <= 90
+        );
+    });
+
+    res.json({
+      items: result,
       status: "online",
-      detail: "Public RSS feeds. Availability varies by publisher."
-    },
-    "USGS Earthquake Feed": {
-      status: "online",
-      detail: "USGS public GeoJSON feed."
-    },
-    "OpenSky Network": {
-      status: "external",
-      detail: "Aircraft data depends on OpenSky connectivity and access limits."
-    },
-    "GDELT": {
-      status: "needs_credentials",
-      detail: "Not connected in this release."
-    },
-    "Maritime AIS": {
-      status: "needs_credentials",
-      detail: "An AIS data provider and API credentials are required."
-    },
-    "NASA FIRMS": {
-      status: "needs_credentials",
-      detail: "A NASA FIRMS MAP_KEY is required."
+      count: result.length
+    });
+
+  } catch (error) {
+    console.error("MARITIME:", error);
+
+    res.status(502).json({
+      items: [],
+      status: "unavailable",
+      count: 0,
+      error: errorText(error)
+    });
+  }
+});
+
+// PROVIDER STATUS
+
+app.get("/api/status", (_req, res) => {
+  res.json({
+    services: {
+      "USGS Earthquakes": {
+        status: "public",
+        detail: "USGS public earthquake feed."
+      },
+      "RSS News": {
+        status: "public",
+        detail: "RSS and Atom sources."
+      },
+      "GDELT": {
+        status: "public",
+        detail: "Global news and event discovery API."
+      },
+      "Aircraft Provider": {
+        status: process.env.ADSB_API_URL
+          ? "configured"
+          : "needs_credentials",
+        detail: process.env.ADSB_API_URL
+          ? "External aircraft provider configured."
+          : "Set ADSB_API_URL and optionally ADSB_API_KEY."
+      },
+      "Maritime AIS": {
+        status: process.env.AIS_API_URL
+          ? "configured"
+          : "needs_credentials",
+        detail: process.env.AIS_API_URL
+          ? "External AIS provider configured."
+          : "Set AIS_API_URL and optionally AIS_API_KEY."
+      },
+      "NASA GIBS": {
+        status: "public",
+        detail: "NASA satellite imagery tiles."
+      }
     }
-  };
-
-  res.json({ services });
+  });
 });
 
 // FRONTEND
