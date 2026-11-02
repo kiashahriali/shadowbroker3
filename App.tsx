@@ -45,7 +45,8 @@ import type {
   LayerState,
   Vessel,
   NewsSource,
-  ProviderStatus
+  ProviderStatus,
+  MarketAsset
 } from "./types";
 
 import "./style.css";
