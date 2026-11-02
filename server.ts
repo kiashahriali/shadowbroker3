@@ -5,7 +5,7 @@ import Parser from "rss-parser";
 import { resolve } from "node:path";
 import { isIP } from "node:net";
 import { RSS_SOURCES } from "./sources";
-import type { NewsSource } from "./types";
+import type { NewsSource, Flight } from "./types";
 
 const app = express();
 const parser = new Parser({
