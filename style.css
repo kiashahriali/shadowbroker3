@@ -350,6 +350,7 @@ button:disabled {
   color: var(--muted);
   font-family: "JetBrains Mono", monospace;
   font-size: 8px;
+  overflow-wrap: anywhere;
 }
 
 .toggle {
@@ -644,28 +645,6 @@ button:disabled {
   font-size: 8px;
 }
 
-.map-marker {
-  width: 25px;
-  height: 25px;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--marker-color);
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--marker-color) 20%, #07111a);
-  color: var(--marker-color);
-  font-size: 13px;
-  cursor: pointer;
-  box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--marker-color) 12%, transparent),
-    0 0 12px color-mix(in srgb, var(--marker-color) 45%, transparent);
-  transition: transform 0.15s;
-}
-
-.map-marker:hover {
-  z-index: 10;
-  transform: scale(1.35);
-}
-
 .map-footer {
   min-height: 38px;
   display: flex;
@@ -940,6 +919,7 @@ button:disabled {
   color: #ffc477;
   font-size: 10px;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 /* NEWS FEED */
@@ -1592,15 +1572,26 @@ button:disabled {
   box-shadow: 0 0 8px rgba(255, 91, 102, 0.7);
 }
 
-.ticker-track {
+/* The viewport clips; the track is as wide as its content so that
+   translateX(-50%) moves exactly one copy of the duplicated list. */
+.ticker-viewport {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 28px;
   overflow: hidden;
+}
+
+.ticker-track {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  width: max-content;
+  gap: 28px;
+  padding-right: 28px;
   white-space: nowrap;
   animation: ticker-scroll 100s linear infinite;
+  will-change: transform;
 }
 
 .ticker-track.paused {
@@ -1643,6 +1634,12 @@ button:disabled {
 
   to {
     transform: translateX(-50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker-track {
+    animation: none;
   }
 }
 
