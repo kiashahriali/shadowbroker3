@@ -165,7 +165,20 @@ const validCoord = (
   return [x, y];
 };
 
-const emptyCollection = (): GeoJSON.FeatureCollection => ({
+// Local GeoJSON types (the global `GeoJSON` namespace is not available
+// in every tsconfig setup, so we don't depend on it).
+type GeoFeature = {
+  type: "Feature";
+  properties: { key: string };
+  geometry: { type: "Point"; coordinates: [number, number] };
+};
+
+type GeoCollection = {
+  type: "FeatureCollection";
+  features: GeoFeature[];
+};
+
+const emptyCollection = (): GeoCollection => ({
   type: "FeatureCollection",
   features: []
 });
@@ -622,8 +635,8 @@ export default function App() {
       prefix: EntityLayerId,
       items: T[],
       coords: (item: T) => [unknown, unknown]
-    ): GeoJSON.FeatureCollection => {
-      const features: GeoJSON.Feature[] = [];
+    ): GeoCollection => {
+      const features: GeoFeature[] = [];
 
       items.forEach((item, i) => {
         const c = validCoord(...coords(item));
@@ -654,7 +667,7 @@ export default function App() {
 
     const apply = (
       id: EntityLayerId,
-      data: GeoJSON.FeatureCollection,
+      data: GeoCollection,
       visible: boolean,
       color: string
     ) => {
@@ -662,7 +675,9 @@ export default function App() {
         | maplibregl.GeoJSONSource
         | undefined;
 
-      source?.setData(data);
+      source?.setData(
+        data as unknown as Parameters<maplibregl.GeoJSONSource["setData"]>[0]
+      );
 
       map.setLayoutProperty(
         `sb-${id}-layer`,
