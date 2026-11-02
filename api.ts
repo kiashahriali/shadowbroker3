@@ -1,4 +1,3 @@
-
 import type {
   Earthquake,
   FeedItem,
@@ -9,44 +8,65 @@ import type {
   MarketAsset
 } from "./types";
 
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store"
-  });
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 45000
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const data = await response.json();
+  try {
+    const response = await fetch(path, {
+      cache: "no-store",
+      ...init,
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    throw new Error(
-      data.error || `HTTP ${response.status}`
-    );
+    const type = response.headers.get("content-type") || "";
+    const text = await response.text();
+
+    if (!type.includes("application/json")) {
+      throw new Error(
+        `${path}: expected JSON but got ${type || "unknown"} ` +
+          `(HTTP ${response.status}). Backend asleep or route missing?`
+      );
+    }
+
+    let data: any;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`${path}: invalid JSON (HTTP ${response.status})`);
+    }
+
+    if (!response.ok) {
+      throw new Error(data?.error || `${path}: HTTP ${response.status}`);
+    }
+
+    return data as T;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`${path}: timeout after ${timeoutMs / 1000}s`);
+    }
+
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return data as T;
 }
 
-async function post<T>(
-  path: string,
-  body: unknown
-): Promise<T> {
-  const response = await fetch(path, {
+const get = <T>(path: string) => request<T>(path);
+
+const post = <T>(path: string, body: unknown) =>
+  request<T>(path, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(body)
   });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data.error || `HTTP ${response.status}`
-    );
-  }
-
-  return data as T;
-}
 
 export const api = {
   news: () =>
