@@ -596,14 +596,14 @@ export default function App() {
   };
 
   const setColor = (
-    key: keyof typeof defaultTheme,
-    value: string
-  ) => {
-    setTheme(old => ({
-      ...old,
-      [key]: value
-    }));
-  };
+  key: keyof typeof defaultTheme,
+  value: string
+) => {
+  setTheme((old: typeof defaultTheme) => ({
+    ...old,
+    [key]: value
+  }));
+};
 
   const setSatelliteMode = () => {
     setLayers(old => ({
