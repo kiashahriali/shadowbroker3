@@ -1,3 +1,4 @@
+
 import type {
   Earthquake,
   FeedItem,
@@ -88,9 +89,9 @@ export const api = {
     }>("/api/vessels"),
 
   sources: () =>
-    get<{ items: NewsSource[] }>(
-      "/api/news/sources"
-    ),
+    get<{
+      items: NewsSource[];
+    }>("/api/news/sources"),
 
   addSource: (source: {
     name: string;
@@ -103,10 +104,9 @@ export const api = {
     }>("/api/news/sources", source),
 
   removeSource: (url: string) =>
-    post<{ ok: boolean }>(
-      "/api/news/sources/remove",
-      { url }
-    ),
+    post<{
+      ok: boolean;
+    }>("/api/news/sources/remove", { url }),
 
   status: () =>
     get<{
