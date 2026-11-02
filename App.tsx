@@ -308,36 +308,44 @@ export default function App() {
     };
   }, []);
 
-  function addSatelliteLayer(map: MapLibreMap) {
-    if (satelliteAdded.current) return;
+function addSatelliteLayer(map: MapLibreMap) {
+  if (satelliteAdded.current) return;
 
-    if (!map.getSource("sb-satellite")) {
-      map.addSource("sb-satellite", {
-        type: "raster",
-        tiles: [
-          "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_CityLights_2012/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpg"
-        ],
-        tileSize: 256,
-        attribution: "NASA GIBS"
-      });
-    }
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - 2);
 
-    if (!map.getLayer("sb-satellite-layer")) {
-      map.addLayer({
-        id: "sb-satellite-layer",
-        type: "raster",
-        source: "sb-satellite",
-        layout: {
-          visibility: "none"
-        },
-        paint: {
-          "raster-opacity": 0.85
-        }
-      });
-    }
+  const imageDate = date.toISOString().slice(0, 10);
 
-    satelliteAdded.current = true;
+  const tileUrl =
+    `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/` +
+    `MODIS_Terra_CorrectedReflectance_TrueColor/default/` +
+    `${imageDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
+
+  if (!map.getSource("sb-satellite")) {
+    map.addSource("sb-satellite", {
+      type: "raster",
+      tiles: [tileUrl],
+      tileSize: 256,
+      attribution: "NASA GIBS / NASA Earthdata"
+    });
   }
+
+  if (!map.getLayer("sb-satellite-layer")) {
+    map.addLayer({
+      id: "sb-satellite-layer",
+      type: "raster",
+      source: "sb-satellite",
+      layout: {
+        visibility: "none"
+      },
+      paint: {
+        "raster-opacity": 0.9
+      }
+    });
+  }
+
+  satelliteAdded.current = true;
+}
 
   function updateSatelliteVisibility(
     map: MapLibreMap,
