@@ -1,4 +1,3 @@
-
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
 
 :root {
@@ -1409,11 +1408,6 @@ button:disabled {
 .market-icon.commodity {
   color: #d7bb82;
   background: rgba(215, 187, 130, 0.09);
-}
-
-.market-icon.stock {
-  color: #56d68d;
-  background: rgba(86, 214, 141, 0.09);
 }
 
 .market-name {
