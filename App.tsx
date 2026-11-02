@@ -1,3 +1,4 @@
+
 import {
   useEffect,
   useMemo,
@@ -36,7 +37,9 @@ import {
   TrendingUp,
   TrendingDown,
   Coins,
-  CircleDollarSign
+  CircleDollarSign,
+  PanelLeftOpen,
+  PanelRightOpen
 } from "lucide-react";
 
 import { api } from "./api";
@@ -102,6 +105,22 @@ type AlertItem = {
 
 type Theme = typeof defaultTheme;
 
+type MarketSample = {
+  symbol: string;
+  price: number;
+  timestamp: number;
+};
+
+type MarketForecast = {
+  symbol: string;
+  name: string;
+  current: number;
+  predicted: number;
+  change: number;
+  direction: "up" | "down" | "neutral";
+  samples: number;
+};
+
 const marketFilters: {
   id: MarketFilter;
   label: string;
@@ -129,12 +148,86 @@ function formatChange(value?: number | null) {
   return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
+function calculateForecast(
+  samples: MarketSample[],
+  asset: MarketAsset
+): MarketForecast | null {
+  const points = samples
+    .filter(
+      sample =>
+        sample.symbol === asset.symbol &&
+        Number.isFinite(sample.price) &&
+        sample.price > 0
+    )
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-20);
+
+  if (points.length < 6) return null;
+
+  const firstTime = points[0].timestamp;
+
+  const x = points.map(
+    point => (point.timestamp - firstTime) / 60000
+  );
+
+  const y = points.map(point => point.price);
+
+  const meanX = x.reduce((sum, value) => sum + value, 0) / x.length;
+  const meanY = y.reduce((sum, value) => sum + value, 0) / y.length;
+
+  const denominator = x.reduce(
+    (sum, value) => sum + Math.pow(value - meanX, 2),
+    0
+  );
+
+  if (denominator === 0) return null;
+
+  const numerator = x.reduce(
+    (sum, value, index) =>
+      sum + (value - meanX) * (y[index] - meanY),
+    0
+  );
+
+  const slope = numerator / denominator;
+
+  const latest = points[points.length - 1];
+  const interval = x.length > 1
+    ? (x[x.length - 1] - x[x.length - 2]) || 2
+    : 2;
+
+  const predicted = latest.price + slope * interval;
+
+  if (!Number.isFinite(predicted) || predicted <= 0) {
+    return null;
+  }
+
+  const change =
+    ((predicted - latest.price) / latest.price) * 100;
+
+  return {
+    symbol: asset.symbol,
+    name: asset.name,
+    current: latest.price,
+    predicted,
+    change,
+    direction:
+      change > 0.015
+        ? "up"
+        : change < -0.015
+          ? "down"
+          : "neutral",
+    samples: points.length
+  };
+}
+
 export default function App() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const markerRefs = useRef<Marker[]>([]);
   const satelliteAdded = useRef(false);
   const loadingRef = useRef(false);
+  const marketLoadingRef = useRef(false);
+  const panelTimerRef = useRef<number | null>(null);
 
   const [layers, setLayers] = useState<LayerState>(() => {
     try {
@@ -181,11 +274,21 @@ export default function App() {
   const [marketServices, setMarketServices] = useState<
     Record<string, ProviderStatus>
   >({});
+
+  const [marketHistory, setMarketHistory] = useState<MarketSample[]>(() => {
+    try {
+      const saved = localStorage.getItem("sb-market-history");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
   const [marketFilter, setMarketFilter] =
     useState<MarketFilter>("all");
+
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketError, setMarketError] = useState("");
-  const marketLoadingRef = useRef(false);
 
   const [activeTab, setActiveTab] = useState<Tab>("news");
 
@@ -209,6 +312,40 @@ export default function App() {
 
   const [sourceMessage, setSourceMessage] = useState("");
   const [tickerPaused, setTickerPaused] = useState(false);
+
+  // PANEL VISIBILITY
+
+  const [panelsVisible, setPanelsVisible] = useState(true);
+
+  const clearPanelTimer = () => {
+    if (panelTimerRef.current !== null) {
+      window.clearTimeout(panelTimerRef.current);
+      panelTimerRef.current = null;
+    }
+  };
+
+  const schedulePanelHide = () => {
+    clearPanelTimer();
+
+    panelTimerRef.current = window.setTimeout(() => {
+      setPanelsVisible(false);
+    }, 5000);
+  };
+
+  const revealPanels = () => {
+    clearPanelTimer();
+    setPanelsVisible(true);
+  };
+
+  const hidePanelsSoon = () => {
+    schedulePanelHide();
+  };
+
+  useEffect(() => {
+    schedulePanelHide();
+
+    return () => clearPanelTimer();
+  }, []);
 
   // DATA LOADING
 
@@ -291,8 +428,56 @@ export default function App() {
     try {
       const result = await api.markets();
 
-      setMarketItems(result.items || []);
+      const items = result.items || [];
+
+      setMarketItems(items);
       setMarketServices(result.services || {});
+
+      const timestamp = Date.now();
+
+      setMarketHistory(previous => {
+        const next = [...previous];
+
+        items.forEach(item => {
+          if (
+            item.price === null ||
+            !Number.isFinite(item.price) ||
+            item.price <= 0
+          ) return;
+
+          const last = [...next]
+            .reverse()
+            .find(sample => sample.symbol === item.symbol);
+
+          // Avoid recording duplicate samples too frequently.
+          if (
+            last &&
+            timestamp - last.timestamp < 60000
+          ) return;
+
+          next.push({
+            symbol: item.symbol,
+            price: item.price,
+            timestamp
+          });
+        });
+
+        const limited = next
+          .sort((a, b) => a.timestamp - b.timestamp)
+          .slice(-1500);
+
+        try {
+          localStorage.setItem(
+            "sb-market-history",
+            JSON.stringify(limited)
+          );
+        } catch (storageError) {
+          console.warn("Market history storage:", storageError);
+        }
+
+        return limited;
+      });
+
     } catch (err: unknown) {
       setMarketError(
         err instanceof Error ? err.message : String(err)
@@ -548,6 +733,8 @@ export default function App() {
     }
 
     if (layers.flights) {
+      // Do not artificially move aircraft positions.
+      // Coordinates must come from the provider.
       flights.slice(0, 500).forEach(flight => {
         addMarker(
           flight.longitude,
@@ -657,6 +844,13 @@ export default function App() {
     commodity: marketItems.filter(item => item.category === "commodity").length,
     stock: marketItems.filter(item => item.category === "stock").length
   }), [marketItems]);
+
+  const forecasts = useMemo(() => {
+    return marketItems
+      .filter(item => item.category === "crypto")
+      .map(item => calculateForecast(marketHistory, item))
+      .filter((item): item is MarketForecast => item !== null);
+  }, [marketItems, marketHistory]);
 
   // HELPERS
 
@@ -829,9 +1023,13 @@ export default function App() {
         </div>
       </header>
 
-      <main className="workspace">
+      <main className={`workspace ${panelsVisible ? "panels-visible" : "panels-hidden"}`}>
 
-        <aside className={`left-rail ${mobilePanel ? "show" : ""}`}>
+        <aside
+          className={`left-rail ${mobilePanel ? "show" : ""}`}
+          onMouseEnter={revealPanels}
+          onMouseLeave={hidePanelsSoon}
+        >
 
           <div className="rail-heading">
             <span>INTELLIGENCE LAYERS</span>
@@ -934,10 +1132,20 @@ export default function App() {
           <div className="rail-foot">
             <span className="tiny-led"/>
             PUBLIC DATA
-            <span className="foot-right">v2.1.0</span>
+            <span className="foot-right">v2.2.0</span>
           </div>
 
         </aside>
+
+        <button
+          className={`panel-edge panel-edge-left ${panelsVisible ? "edge-hidden" : ""}`}
+          onMouseEnter={revealPanels}
+          onClick={revealPanels}
+          aria-label="Show intelligence layers"
+          title="Show intelligence layers"
+        >
+          <PanelLeftOpen size={17}/>
+        </button>
 
         <section className="map-section">
 
@@ -1119,7 +1327,11 @@ export default function App() {
 
         </section>
 
-        <aside className="right-panel">
+        <aside
+          className="right-panel"
+          onMouseEnter={revealPanels}
+          onMouseLeave={hidePanelsSoon}
+        >
 
           <div className="panel-tabs">
 
@@ -1505,6 +1717,93 @@ export default function App() {
 
               </div>
 
+              <div className="prediction-section">
+
+                <div className="prediction-heading">
+                  <div>
+                    <div className="eyebrow">EXPERIMENTAL ANALYTICS</div>
+                    <h3>Market prediction</h3>
+                  </div>
+
+                  <span className="prediction-tag">
+                    LINEAR TREND
+                  </span>
+                </div>
+
+                <p className="prediction-explainer">
+                  Short-term trend projection based on locally
+                  collected price observations. This is not a
+                  validated trading signal.
+                </p>
+
+                {forecasts.map(forecast => (
+                  <div className="forecast-card" key={forecast.symbol}>
+
+                    <div className="forecast-top">
+                      <strong>{forecast.symbol}</strong>
+
+                      <span className={`forecast-direction ${forecast.direction}`}>
+                        {forecast.direction === "up" ? (
+                          <TrendingUp size={13}/>
+                        ) : forecast.direction === "down" ? (
+                          <TrendingDown size={13}/>
+                        ) : null}
+
+                        {forecast.direction.toUpperCase()}
+                      </span>
+                    </div>
+
+                    <div className="forecast-values">
+                      <div>
+                        <small>CURRENT</small>
+                        <strong>
+                          {formatPrice(
+                            forecast.current,
+                            marketItems.find(
+                              item => item.symbol === forecast.symbol
+                            )?.currency || "USD"
+                          )}
+                        </strong>
+                      </div>
+
+                      <div>
+                        <small>NEXT INTERVAL ESTIMATE</small>
+                        <strong>
+                          {formatPrice(
+                            forecast.predicted,
+                            marketItems.find(
+                              item => item.symbol === forecast.symbol
+                            )?.currency || "USD"
+                          )}
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className={`forecast-change ${forecast.direction}`}>
+                      Estimated change: {formatChange(forecast.change)}
+                    </div>
+
+                    <div className="forecast-samples">
+                      Based on {forecast.samples} locally collected samples
+                    </div>
+
+                  </div>
+                ))}
+
+                {!forecasts.length && (
+                  <div className="prediction-empty">
+                    <Activity size={20}/>
+                    <strong>Collecting historical observations</strong>
+                    <p>
+                      At least 6 price samples per asset are required.
+                      Samples are collected approximately every 2 minutes
+                      while this dashboard is running.
+                    </p>
+                  </div>
+                )}
+
+              </div>
+
               <div className="market-provider-list">
                 <div className="eyebrow">PROVIDER STATUS</div>
 
@@ -1530,8 +1829,10 @@ export default function App() {
                   the configured provider.
                 </p>
                 <p>
-                  This dashboard displays market data and does not
-                  provide investment recommendations.
+                  Prediction uses a simple linear trend projection
+                  over locally collected samples. It is not a
+                  financial recommendation and does not estimate
+                  the probability of a price movement.
                 </p>
               </div>
 
@@ -1586,6 +1887,16 @@ export default function App() {
           </div>
 
         </aside>
+
+        <button
+          className={`panel-edge panel-edge-right ${panelsVisible ? "edge-hidden" : ""}`}
+          onMouseEnter={revealPanels}
+          onClick={revealPanels}
+          aria-label="Show right panel"
+          title="Show right panel"
+        >
+          <PanelRightOpen size={17}/>
+        </button>
 
       </main>
 
