@@ -1,3 +1,4 @@
+
 export type NewsCategory =
   | "world"
   | "conflict"
@@ -73,7 +74,11 @@ export type NewsSource = {
 export type MarketAsset = {
   symbol: string;
   name: string;
-  category: "crypto" | "forex" | "commodity" | "stock";
+  category:
+    | "crypto"
+    | "forex"
+    | "commodity"
+    | "stock";
   price: number | null;
   change24h?: number | null;
   currency: string;
