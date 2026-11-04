@@ -5,7 +5,8 @@ import Parser from "rss-parser";
 import { resolve } from "node:path";
 import { isIP } from "node:net";
 import { RSS_SOURCES } from "./sources";
-import type { NewsSource, Flight } from "./types";
+import type { NewsSource } from "./types";
+import { startLive, registerLiveRoutes, liveStatus } from "./live";
 
 const app = express();
 const parser = new Parser({
@@ -370,219 +371,6 @@ app.get("/api/events", async (_req, res) => {
     });
   }
 });
-// MARKETS
-
-app.get("/api/markets", async (_req, res) => {
-  const services: Record<string, {
-    status: string;
-    detail: string;
-  }> = {};
-
-  const items: any[] = [];
-
-  // CRYPTO - BINANCE PUBLIC MARKET DATA
-
-  try {
-    const symbols = [
-      "BTCUSDT",
-      "ETHUSDT",
-      "BNBUSDT",
-      "SOLUSDT",
-      "XRPUSDT",
-      "DOGEUSDT",
-      "ADAUSDT"
-    ];
-
-    const url =
-      "https://data-api.binance.vision/api/v3/ticker/24hr";
-
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(12000)
-    });
-
-    if (!response.ok) {
-      throw new Error(`Binance HTTP ${response.status}`);
-    }
-
-    const data: any[] = await response.json();
-
-    for (const symbol of symbols) {
-      const row = data.find(
-        item => item.symbol === symbol
-      );
-
-      if (!row) continue;
-
-      items.push({
-        symbol,
-        name: symbol.replace("USDT", ""),
-        category: "crypto",
-        price: Number(row.lastPrice),
-        change24h: Number(row.priceChangePercent),
-        currency: "USDT",
-        source: "Binance",
-        updatedAt: new Date().toISOString()
-      });
-    }
-
-    services.Binance = {
-      status: "online",
-      detail: "Public cryptocurrency market data."
-    };
-
-  } catch (error) {
-    services.Binance = {
-      status: "unavailable",
-      detail: errorText(error)
-    };
-  }
-
-  // FOREX - FRANKFURTER REFERENCE RATES
-
-  try {
-    const response = await fetch(
-      "https://api.frankfurter.dev/v2/rates?base=USD&quotes=EUR,GBP,JPY,CHF,CAD",
-      {
-        signal: AbortSignal.timeout(12000)
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Frankfurter HTTP ${response.status}`
-      );
-    }
-
-    const data: any[] = await response.json();
-
-    for (const row of data) {
-      items.push({
-        symbol: `USD/${row.quote}`,
-        name: `USD to ${row.quote}`,
-        category: "forex",
-        price: Number(row.rate),
-        currency: row.quote,
-        source: "Frankfurter",
-        updatedAt: row.date
-      });
-    }
-
-    services.Frankfurter = {
-      status: "online",
-      detail: "Daily reference exchange rates; not live trading quotes."
-    };
-
-  } catch (error) {
-    services.Frankfurter = {
-      status: "unavailable",
-      detail: errorText(error)
-    };
-  }
-
-  // OPTIONAL: GOLD API
-
-  try {
-    const response = await fetch(
-      "https://api.gold-api.com/price/XAU",
-      {
-        signal: AbortSignal.timeout(12000)
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Gold API HTTP ${response.status}`);
-    }
-
-    const data: any = await response.json();
-
-    const price = Number(data.price);
-
-    if (Number.isFinite(price)) {
-      items.push({
-        symbol: "XAU/USD",
-        name: "Gold",
-        category: "commodity",
-        price,
-        currency: "USD",
-        source: "Gold API",
-        updatedAt: data.updatedAt || new Date().toISOString()
-      });
-    }
-
-    services.Gold = {
-      status: "online",
-      detail: "Gold spot price from Gold API."
-    };
-
-  } catch (error) {
-    services.Gold = {
-      status: "unavailable",
-      detail: errorText(error)
-    };
-  }
-
-  // OIL - EIA API, OPTIONAL KEY
-
-  if (process.env.EIA_API_KEY) {
-    try {
-      const url = new URL(
-        "https://api.eia.gov/v2/petroleum/pri/spt/data/"
-      );
-
-      url.searchParams.set("api_key", process.env.EIA_API_KEY);
-      url.searchParams.set("frequency", "daily");
-      url.searchParams.set("data[0]", "value");
-      url.searchParams.set("facets[product][]", "EPCWTI");
-      url.searchParams.set("sort[0][column]", "period");
-      url.searchParams.set("sort[0][direction]", "desc");
-      url.searchParams.set("length", "1");
-
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(12000)
-      });
-
-      if (!response.ok) {
-        throw new Error(`EIA HTTP ${response.status}`);
-      }
-
-      const data: any = await response.json();
-      const row = data.response?.data?.[0];
-
-      if (row && Number.isFinite(Number(row.value))) {
-        items.push({
-          symbol: "WTI",
-          name: "WTI Crude Oil",
-          category: "commodity",
-          price: Number(row.value),
-          currency: "USD/barrel",
-          source: "EIA",
-          updatedAt: row.period
-        });
-      }
-
-      services.EIA = {
-        status: "online",
-        detail: "Daily WTI price from US EIA."
-      };
-
-    } catch (error) {
-      services.EIA = {
-        status: "unavailable",
-        detail: errorText(error)
-      };
-    }
-  } else {
-    services.EIA = {
-      status: "needs_credentials",
-      detail: "Set EIA_API_KEY in Render environment variables."
-    };
-  }
-
-  res.json({
-    items,
-    services
-  });
-});
 // EARTHQUAKES
 
 app.get("/api/earthquakes", async (_req, res) => {
@@ -631,194 +419,14 @@ app.get("/api/earthquakes", async (_req, res) => {
   }
 });
 
-// AIRCRAFT PROVIDER
-// ADSB_API_URL must return JSON with an aircraft array.
-// Supported formats:
-// { aircraft: [{ hex, flight, lat, lon, alt_baro, gs, track }] }
-// or { items: [...] } with normalized fields.
+// AIRCRAFT (ADSB.lol) and MARITIME (AISStream.io)
+// Implemented in adsb.ts / ais.ts and registered through live.ts.
 
-// AIRCRAFT - ADSB.LOL
-
-app.get("/api/flights", async (_req, res) => {
-  try {
-    const result = await cached("flights", async () => {
-      const regions = [
-        [40, -100],
-        [50, 10],
-        [30, 50],
-        [35, 110],
-        [-25, 135],
-        [-20, -60],
-        [0, 20],
-        [20, 120]
-      ];
-
-      const responses = await Promise.allSettled(
-        regions.map(async ([lat, lon]) => {
-          const url =
-            `https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/250`;
-
-          const response = await fetch(url, {
-            headers: {
-              "User-Agent": "SHADOWBROKER/2.0"
-            },
-            signal: AbortSignal.timeout(15000)
-          });
-
-          if (!response.ok) {
-            throw new Error(
-              `ADSB.LOL HTTP ${response.status}`
-            );
-          }
-
-          return response.json() as Promise<{
-            ac?: any[];
-          }>;
-        })
-      );
-
-      const unique = new Map<string, Flight>();
-
-      for (const response of responses) {
-        if (response.status !== "fulfilled") {
-          continue;
-        }
-
-        for (const item of response.value.ac || []) {
-          const longitude = Number(item.lon);
-          const latitude = Number(item.lat);
-
-          if (
-            !Number.isFinite(longitude) ||
-            !Number.isFinite(latitude) ||
-            longitude < -180 ||
-            longitude > 180 ||
-            latitude < -90 ||
-            latitude > 90
-          ) {
-            continue;
-          }
-
-          const icao24 = String(item.hex || "").toLowerCase();
-
-          if (!icao24) continue;
-
-          unique.set(icao24, {
-            icao24,
-            callsign: String(item.flight || "").trim(),
-            originCountry: String(item.ownOp || ""),
-            longitude,
-            latitude,
-            altitude: Number.isFinite(Number(item.alt_baro))
-              ? Number(item.alt_baro)
-              : null,
-            velocity: Number.isFinite(Number(item.gs))
-              ? Number(item.gs)
-              : null,
-            heading: Number.isFinite(Number(item.track))
-              ? Number(item.track)
-              : null
-          });
-        }
-      }
-
-      return [...unique.values()];
-    });
-
-    res.json({
-      items: result,
-      status: result.length ? "online" : "unavailable",
-      count: result.length,
-      detail: "ADSB.LOL public aircraft feed. Regional sampling."
-    });
-
-  } catch (error) {
-    console.error("AIRCRAFT:", error);
-
-    res.status(502).json({
-      items: [],
-      status: "unavailable",
-      count: 0,
-      error: errorText(error)
-    });
-  }
-});
-
-// MARITIME PROVIDER
-// AIS_API_URL must return { items: [...] } or { vessels: [...] }.
-
-app.get("/api/vessels", async (_req, res) => {
-  const endpoint = process.env.AIS_API_URL;
-
-  if (!endpoint) {
-    return res.json({
-      items: [],
-      status: "needs_credentials",
-      count: 0,
-      detail: "Configure AIS_API_URL to enable vessel tracking."
-    });
-  }
-
-  try {
-    const result = await cached("vessels", async () => {
-      const url = validatePublicUrl(endpoint);
-
-      const response = await fetch(url, {
-        headers: process.env.AIS_API_KEY
-          ? { Authorization: `Bearer ${process.env.AIS_API_KEY}` }
-          : {},
-        signal: AbortSignal.timeout(20000)
-      });
-
-      if (!response.ok) {
-        throw new Error(`AIS provider HTTP ${response.status}`);
-      }
-
-      const data: any = await response.json();
-      const rows = data.vessels || data.items || [];
-
-      return rows
-        .map((item: any) => ({
-          mmsi: String(item.mmsi || item.MMSI || ""),
-          name: item.name || item.shipname || "Unknown vessel",
-          longitude: Number(item.longitude ?? item.lon),
-          latitude: Number(item.latitude ?? item.lat),
-          speed: item.speed ?? item.sog ?? null,
-          heading: item.heading ?? item.cog ?? null,
-          destination: item.destination || "",
-          vesselType: item.vesselType || item.ship_type || ""
-        }))
-        .filter((item: any) =>
-          Number.isFinite(item.longitude) &&
-          Number.isFinite(item.latitude) &&
-          item.longitude >= -180 &&
-          item.longitude <= 180 &&
-          item.latitude >= -90 &&
-          item.latitude <= 90
-        );
-    });
-
-    res.json({
-      items: result,
-      status: "online",
-      count: result.length
-    });
-
-  } catch (error) {
-    console.error("MARITIME:", error);
-
-    res.status(502).json({
-      items: [],
-      status: "unavailable",
-      count: 0,
-      error: errorText(error)
-    });
-  }
-});
+registerLiveRoutes(app);
 
 // PROVIDER STATUS
 
-app.get("/api/status", (_req, res) => {
+app.get("/api/status", async (_req, res) => {
   res.json({
     services: {
       "USGS Earthquakes": {
@@ -829,30 +437,7 @@ app.get("/api/status", (_req, res) => {
         status: "public",
         detail: "RSS and Atom sources."
       },
-      "GDELT": {
-        status: "public",
-        detail: "Global news and event discovery API."
-      },
-      "Aircraft Provider": {
-        status: process.env.ADSB_API_URL
-          ? "configured"
-          : "needs_credentials",
-        detail: process.env.ADSB_API_URL
-          ? "External aircraft provider configured."
-          : "Set ADSB_API_URL and optionally ADSB_API_KEY."
-      },
-      "Maritime AIS": {
-        status: process.env.AIS_API_URL
-          ? "configured"
-          : "needs_credentials",
-        detail: process.env.AIS_API_URL
-          ? "External AIS provider configured."
-          : "Set AIS_API_URL and optionally AIS_API_KEY."
-      },
-      "NASA GIBS": {
-        status: "public",
-        detail: "NASA satellite imagery tiles."
-      }
+      ...(await liveStatus())
     }
   });
 });
@@ -866,6 +451,8 @@ app.use(express.static(frontendDist));
 app.get("*", (_req, res) => {
   res.sendFile(resolve(frontendDist, "index.html"));
 });
+
+startLive();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`SHADOWBROKER listening on ${PORT}`);

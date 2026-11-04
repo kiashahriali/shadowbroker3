@@ -1,4 +1,9 @@
 import type {
+  ConflictCluster,
+  MarketAnalysis,
+  MarketHistory,
+  SatelliteLayerInfo,
+  SatelliteScene,
   Earthquake,
   FeedItem,
   Flight,
@@ -57,7 +62,7 @@ async function request<T>(
   }
 }
 
-const get = <T>(path: string) => request<T>(path);
+const get = <T>(path: string, timeoutMs?: number) => request<T>(path, undefined, timeoutMs);
 
 const post = <T>(path: string, body: unknown) =>
   request<T>(path, {
@@ -137,5 +142,45 @@ export const api = {
     get<{
       items: MarketAsset[];
       services: Record<string, ProviderStatus>;
-    }>("/api/markets")
+      updatedAt: string;
+    }>("/api/markets"),
+
+  marketHistory: (symbol: string, range: string) =>
+    get<MarketHistory>(
+      `/api/markets/history?symbol=${encodeURIComponent(symbol)}&range=${encodeURIComponent(range)}`
+    ),
+
+  marketAnalysis: (symbol: string) =>
+    get<MarketAnalysis>(
+      `/api/markets/analysis?symbol=${encodeURIComponent(symbol)}`,
+      60000
+    ),
+
+  conflicts: () =>
+    get<{
+      conflicts: ConflictCluster[];
+      protests: ConflictCluster[];
+      status: string;
+      detail: string;
+      eventCount: number;
+      windowHours: number;
+    }>("/api/conflicts"),
+
+  satelliteLayers: () =>
+    get<{
+      layers: SatelliteLayerInfo[];
+      ok: boolean;
+      detail: string;
+      updatedAt: string;
+    }>("/api/satellite/layers", 90000),
+
+  scenes: (bbox: number[], hours = 96, cloud = 40) =>
+    get<{
+      scenes: SatelliteScene[];
+      ok: boolean;
+      detail: string;
+    }>(
+      `/api/satellite/scenes?bbox=${bbox.map(n => n.toFixed(3)).join(",")}&hours=${hours}&cloud=${cloud}`,
+      40000
+    )
 };

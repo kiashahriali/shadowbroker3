@@ -1,13 +1,6 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState
-} from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import maplibregl, {
-  Map as MapLibreMap
-} from "maplibre-gl";
+import maplibregl, { Map as MapLibreMap } from "maplibre-gl";
 
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -16,41 +9,53 @@ import {
   AlertTriangle,
   Anchor,
   Bell,
+  ChartNoAxesCombined,
   Crosshair,
+  Globe,
   Globe2,
   Layers,
   Menu,
   Newspaper,
+  Palette,
   Plane,
+  Plus,
   Radio,
   RefreshCw,
+  Satellite,
   Search,
   Settings2,
   Shield,
-  X,
-  Zap,
-  Satellite,
-  Plus,
+  Sparkles,
   Trash2,
-  Palette,
-  ChartNoAxesCombined,
-  TrendingUp,
-  TrendingDown,
-  Coins,
-  CircleDollarSign
+  X,
+  Zap
 } from "lucide-react";
 
 import { api } from "./api";
+import MarketsPanel from "./MarketsPanel";
+import SatellitePanel, { ago } from "./SatellitePanel";
+import {
+  FLIGHT_COLORS,
+  FLIGHT_LEGEND,
+  VESSEL_COLORS,
+  VESSEL_LEGEND,
+  ensureIcon,
+  iconDataUrl,
+  type IconShape
+} from "./mapIcons";
 
 import type {
+  ConflictCluster,
   Earthquake,
   FeedItem,
   Flight,
   LayerState,
-  Vessel,
+  MarketAsset,
   NewsSource,
   ProviderStatus,
-  MarketAsset
+  SatelliteLayerInfo,
+  SatelliteScene,
+  Vessel
 } from "./types";
 
 import "./style.css";
@@ -61,7 +66,8 @@ const initialLayers: LayerState = {
   conflicts: true,
   protests: true,
   vessels: true,
-  satellite: false
+  satellite: false,
+  scenes: true
 };
 
 const defaultTheme = {
@@ -80,19 +86,7 @@ const defaultTheme = {
 const timeLabel = (date?: string) =>
   date ? new Date(date).toLocaleString() : "Time unavailable";
 
-type Tab =
-  | "news"
-  | "alerts"
-  | "sources"
-  | "settings"
-  | "markets";
-
-type MarketFilter =
-  | "all"
-  | "crypto"
-  | "forex"
-  | "commodity"
-  | "stock";
+type Tab = "news" | "alerts" | "sources" | "settings" | "markets" | "satellite";
 
 type AlertItem = {
   id: string;
@@ -103,56 +97,46 @@ type AlertItem = {
 
 type Theme = typeof defaultTheme;
 
-type Entity = FeedItem | Earthquake | Flight | Vessel;
+type Entity =
+  | FeedItem
+  | Earthquake
+  | Flight
+  | Vessel
+  | ConflictCluster
+  | SatelliteScene
+  | SatelliteLayerInfo;
 
-const marketFilters: {
-  id: MarketFilter;
-  label: string;
-}[] = [
-  { id: "all", label: "ALL" },
-  { id: "crypto", label: "CRYPTO" },
-  { id: "forex", label: "FOREX" },
-  { id: "commodity", label: "COMMODITIES" },
-  { id: "stock", label: "STOCKS" }
-];
+/* ---------------------------------------------------------- map layer setup */
 
-function formatPrice(value: number | null, currency: string) {
-  if (value === null || !Number.isFinite(value)) return "—";
+// Local GeoJSON types (the global `GeoJSON` namespace is not available in this tsconfig)
+type GeoFeature = {
+  type: "Feature";
+  properties: Record<string, string | number>;
+  geometry: { type: "Point"; coordinates: [number, number] };
+};
 
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: value < 1 ? 6 : 2
-  }).format(value) + ` ${currency}`;
-}
+type GeoCollection = { type: "FeatureCollection"; features: GeoFeature[] };
 
-function formatChange(value?: number | null) {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return "—";
-  }
+const emptyCollection = (): GeoCollection => ({ type: "FeatureCollection", features: [] });
 
-  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
-}
-
-// MAP ENTITY LAYERS (GeoJSON — replaces DOM markers)
-
-const ENTITY_LAYERS = [
-  { id: "quakes", radius: 6 },
-  { id: "vessels", radius: 4 },
-  { id: "flights", radius: 3.5 }
+// [size at zoom 1, zoom 6, zoom 12] - small pictograms
+const SYMBOL_LAYERS = [
+  { id: "conflicts", size: [0.5, 0.62, 0.95] },
+  { id: "protests", size: [0.5, 0.62, 0.95] },
+  { id: "vessels", size: [0.4, 0.52, 0.85] },
+  { id: "flights", size: [0.42, 0.55, 0.9] },
+  { id: "scenes", size: [0.6, 0.72, 1.0] }
 ] as const;
 
-type EntityLayerId = (typeof ENTITY_LAYERS)[number]["id"];
+type EntityLayerId = "quakes" | (typeof SYMBOL_LAYERS)[number]["id"];
 
-const SATELLITE_LAYER = "sb-satellite-layer";
+const ENTITY_IDS: EntityLayerId[] = ["quakes", "conflicts", "protests", "vessels", "flights", "scenes"];
 
-/**
- * Returns [lon, lat] or null when the position is unusable.
- * Null / empty / NaN / out of range / (0,0) are all rejected so
- * they can never pile up on a single point.
- */
-const validCoord = (
-  lon: unknown,
-  lat: unknown
-): [number, number] | null => {
+const SAT_LAYER = "sb-satellite-layer";
+const OVERLAY_LAYER = "sb-scene-overlay-layer";
+
+/** [lon, lat] or null. Null / NaN / out of range / (0,0) can never pile up on one point. */
+const validCoord = (lon: unknown, lat: unknown): [number, number] | null => {
   if (lon == null || lat == null || lon === "" || lat === "") return null;
 
   const x = Number(lon);
@@ -160,78 +144,79 @@ const validCoord = (
 
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   if (Math.abs(x) > 180 || Math.abs(y) > 90) return null;
-  if (x === 0 && y === 0) return null; // Null Island
+  if (x === 0 && y === 0) return null;
 
   return [x, y];
 };
 
-// Local GeoJSON types (the global `GeoJSON` namespace is not available
-// in every tsconfig setup, so we don't depend on it).
-type GeoFeature = {
-  type: "Feature";
-  properties: { key: string };
-  geometry: { type: "Point"; coordinates: [number, number] };
-};
-
-type GeoCollection = {
-  type: "FeatureCollection";
-  features: GeoFeature[];
-};
-
-const emptyCollection = (): GeoCollection => ({
-  type: "FeatureCollection",
-  features: []
-});
-
 function ensureEntityLayers(map: MapLibreMap) {
-  ENTITY_LAYERS.forEach(({ id, radius }) => {
+  ENTITY_IDS.forEach(id => {
     if (!map.getSource(`sb-${id}`)) {
-      map.addSource(`sb-${id}`, {
-        type: "geojson",
-        data: emptyCollection()
-      });
-    }
-
-    if (!map.getLayer(`sb-${id}-layer`)) {
-      map.addLayer({
-        id: `sb-${id}-layer`,
-        type: "circle",
-        source: `sb-${id}`,
-        paint: {
-          "circle-radius": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            1,
-            radius,
-            8,
-            radius + 3
-          ],
-          "circle-color": "#53c7f4",
-          "circle-opacity": 0.88,
-          "circle-stroke-width": 1,
-          "circle-stroke-color": "#07111a"
-        }
-      });
+      map.addSource(`sb-${id}`, { type: "geojson", data: emptyCollection() as never });
     }
   });
+
+  if (!map.getLayer("sb-quakes-layer")) {
+    map.addLayer({
+      id: "sb-quakes-layer",
+      type: "circle",
+      source: "sb-quakes",
+      paint: {
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 1, 4, 8, 9],
+        "circle-color": "#ffb454",
+        "circle-opacity": 0.75,
+        "circle-stroke-width": 1,
+        "circle-stroke-color": "#07111a"
+      }
+    });
+  }
+
+  SYMBOL_LAYERS.forEach(({ id, size }) => {
+    if (map.getLayer(`sb-${id}-layer`)) return;
+
+    map.addLayer({
+      id: `sb-${id}-layer`,
+      type: "symbol",
+      source: `sb-${id}`,
+      layout: {
+        "icon-image": ["get", "icon"],
+        "icon-size": ["interpolate", ["linear"], ["zoom"], 1, size[0], 6, size[1], 12, size[2]],
+        "icon-rotate": ["get", "rot"],
+        "icon-rotation-alignment": "map",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "symbol-sort-key": ["get", "z"]
+      }
+    });
+  });
+}
+
+const m2ft = (m?: number | null) => (m == null ? null : Math.round(m * 3.28084));
+const ms2kt = (v?: number | null) => (v == null ? null : Math.round(v * 1.94384));
+
+const SAT_SEEN_KEY = "sb-sat-seen";
+
+function readSeen(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(SAT_SEEN_KEY) || "{}");
+  } catch {
+    return {};
+  }
 }
 
 export default function App() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
-  const satelliteAdded = useRef(false);
   const loadingRef = useRef(false);
   const entityIndex = useRef<Record<string, Entity>>({});
+  const labelBefore = useRef<string | undefined>(undefined);
+  const layersRef = useRef<LayerState>(initialLayers);
+  const globeRef = useRef(false);
 
   const [layers, setLayers] = useState<LayerState>(() => {
     try {
       const saved = localStorage.getItem("sb-layers");
-
-      return {
-        ...initialLayers,
-        ...(saved ? JSON.parse(saved) : {})
-      };
+      return { ...initialLayers, ...(saved ? JSON.parse(saved) : {}) };
     } catch {
       return initialLayers;
     }
@@ -240,51 +225,58 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(() => {
     try {
       const saved = localStorage.getItem("sb-theme");
-
-      return {
-        ...defaultTheme,
-        ...(saved ? JSON.parse(saved) : {})
-      };
+      return { ...defaultTheme, ...(saved ? JSON.parse(saved) : {}) };
     } catch {
       return defaultTheme;
     }
   });
+
+  const [globe, setGlobe] = useState<boolean>(() => localStorage.getItem("sb-globe") === "1");
 
   const [news, setNews] = useState<FeedItem[]>([]);
   const [events, setEvents] = useState<FeedItem[]>([]);
   const [quakes, setQuakes] = useState<Earthquake[]>([]);
   const [flights, setFlights] = useState<Flight[]>([]);
   const [vessels, setVessels] = useState<Vessel[]>([]);
+  const [conflicts, setConflicts] = useState<ConflictCluster[]>([]);
+  const [protests, setProtests] = useState<ConflictCluster[]>([]);
 
   const [flightInfo, setFlightInfo] = useState("");
   const [vesselInfo, setVesselInfo] = useState("");
-
-  // Records the backend sent without a usable position
+  const [conflictInfo, setConflictInfo] = useState("");
   const [dropped, setDropped] = useState<Record<string, number>>({});
 
-  const [serviceStatus, setServiceStatus] =
-    useState<Record<string, ProviderStatus>>({});
-
-  const [sourceStatus, setSourceStatus] = useState<
-    { source: string; status: string; error?: string }[]
-  >([]);
-
+  const [serviceStatus, setServiceStatus] = useState<Record<string, ProviderStatus>>({});
+  const [sourceStatus, setSourceStatus] = useState<{ source: string; status: string; error?: string }[]>([]);
   const [sources, setSources] = useState<NewsSource[]>([]);
 
   const [marketItems, setMarketItems] = useState<MarketAsset[]>([]);
-  const [marketServices, setMarketServices] = useState<
-    Record<string, ProviderStatus>
-  >({});
-  const [marketFilter, setMarketFilter] =
-    useState<MarketFilter>("all");
+  const [marketServices, setMarketServices] = useState<Record<string, ProviderStatus>>({});
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketError, setMarketError] = useState("");
   const marketLoadingRef = useRef(false);
 
+  // satellite
+  const [satLayers, setSatLayers] = useState<SatelliteLayerInfo[]>([]);
+  const [satDetail, setSatDetail] = useState("");
+  const [satLoading, setSatLoading] = useState(false);
+  const [satSelected, setSatSelected] = useState<string>(() => localStorage.getItem("sb-sat-layer") || "");
+  const [satOpacity, setSatOpacity] = useState<number>(() => Number(localStorage.getItem("sb-sat-opacity")) || 0.9);
+  const [fresh, setFresh] = useState<Set<string>>(new Set());
+  const announced = useRef<Record<string, string>>({});
+
+  const [scenes, setScenes] = useState<SatelliteScene[]>([]);
+  const [scenesDetail, setScenesDetail] = useState("");
+  const [scenesBusy, setScenesBusy] = useState(false);
+  const [zoomOk, setZoomOk] = useState(false);
+  const [sceneOverlay, setSceneOverlay] = useState<SatelliteScene | null>(null);
+  const scenesSeq = useRef(0);
+  const knownScenes = useRef<Set<string> | null>(null);
+
+  const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
+
   const [activeTab, setActiveTab] = useState<Tab>("news");
-
   const [selected, setSelected] = useState<Entity | null>(null);
-
   const [query, setQuery] = useState("");
   const [mobilePanel, setMobilePanel] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -296,13 +288,20 @@ export default function App() {
 
   const [newSourceName, setNewSourceName] = useState("");
   const [newSourceUrl, setNewSourceUrl] = useState("");
-  const [newSourceCategory, setNewSourceCategory] =
-    useState("world");
-
+  const [newSourceCategory, setNewSourceCategory] = useState("world");
   const [sourceMessage, setSourceMessage] = useState("");
   const [tickerPaused, setTickerPaused] = useState(false);
 
-  // DATA LOADING
+  layersRef.current = layers;
+  globeRef.current = globe;
+
+  const toast = (text: string) => {
+    const id = Date.now() + Math.random();
+    setToasts(t => [...t.slice(-3), { id, text }]);
+    window.setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 9000);
+  };
+
+  /* -------------------------------------------------------------- data loading */
 
   const load = async () => {
     if (loadingRef.current) return;
@@ -312,91 +311,74 @@ export default function App() {
     setError("");
 
     try {
-      const results = await Promise.allSettled([
-        api.news(),
-        api.events(),
-        api.earthquakes(),
-        api.flights(),
-        api.vessels(),
-        api.status(),
-        api.sources()
-      ]);
+      const tasks = {
+        news: api.news(),
+        events: api.events(),
+        earthquakes: api.earthquakes(),
+        flights: api.flights(),
+        vessels: api.vessels(),
+        conflicts: api.conflicts(),
+        status: api.status(),
+        sources: api.sources()
+      };
 
-      if (results[0].status === "fulfilled") {
-        setNews(results[0].value.items || []);
-        setSourceStatus(results[0].value.sourceStatus || []);
+      const keys = Object.keys(tasks) as (keyof typeof tasks)[];
+      const settled = await Promise.allSettled(keys.map(k => tasks[k]));
+
+      const pick = <K extends keyof typeof tasks>(key: K) => {
+        const r = settled[keys.indexOf(key)];
+        return r.status === "fulfilled" ? (r.value as Awaited<(typeof tasks)[K]>) : null;
+      };
+
+      const n = pick("news");
+      if (n) { setNews(n.items || []); setSourceStatus(n.sourceStatus || []); }
+
+      const ev = pick("events");
+      if (ev) setEvents(ev.items || []);
+
+      const q = pick("earthquakes");
+      if (q) setQuakes(q.items || []);
+
+      const f = pick("flights");
+      if (f) { setFlights(f.items || []); setFlightInfo(f.detail || f.status || ""); }
+
+      const v = pick("vessels");
+      if (v) { setVessels(v.items || []); setVesselInfo(v.detail || v.status || ""); }
+
+      const c = pick("conflicts");
+      if (c) {
+        setConflicts(c.conflicts || []);
+        setProtests(c.protests || []);
+        setConflictInfo(c.detail || c.status || "");
       }
 
-      if (results[1].status === "fulfilled") {
-        setEvents(results[1].value.items || []);
-      }
+      const st = pick("status");
+      if (st) setServiceStatus(st.services || {});
 
-      if (results[2].status === "fulfilled") {
-        setQuakes(results[2].value.items || []);
-      }
+      const so = pick("sources");
+      if (so) setSources(so.items || []);
 
-      if (results[3].status === "fulfilled") {
-        setFlights(results[3].value.items || []);
-        setFlightInfo(
-          results[3].value.detail || results[3].value.status || ""
-        );
-      }
-
-      if (results[4].status === "fulfilled") {
-        setVessels(results[4].value.items || []);
-        setVesselInfo(
-          results[4].value.detail || results[4].value.status || ""
-        );
-      }
-
-      if (results[5].status === "fulfilled") {
-        setServiceStatus(results[5].value.services || {});
-      }
-
-      if (results[6].status === "fulfilled") {
-        setSources(results[6].value.items || []);
-      }
-
-      const names = [
-        "news",
-        "events",
-        "earthquakes",
-        "flights",
-        "vessels",
-        "status",
-        "sources"
-      ];
-
-      const failures = results
-        .map((result, index) =>
-          result.status === "rejected"
-            ? `${names[index]}: ${
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason)
-              }`
+      const failures = settled
+        .map((r, i) =>
+          r.status === "rejected"
+            ? `${keys[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
             : null
         )
         .filter(Boolean) as string[];
 
-      if (failures.length > 0) {
+      if (failures.length) {
         console.warn("[load] failed:", failures);
         setError(failures.join(" | "));
       }
 
       setLastUpdated(new Date());
-
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : String(err)
-      );
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       loadingRef.current = false;
       setBusy(false);
     }
   };
-
-  // MARKET DATA
 
   const loadMarkets = async () => {
     if (marketLoadingRef.current) return;
@@ -407,139 +389,161 @@ export default function App() {
 
     try {
       const result = await api.markets();
-
       setMarketItems(result.items || []);
       setMarketServices(result.services || {});
     } catch (err: unknown) {
-      setMarketError(
-        err instanceof Error ? err.message : String(err)
-      );
+      setMarketError(err instanceof Error ? err.message : String(err));
     } finally {
       marketLoadingRef.current = false;
       setMarketLoading(false);
     }
   };
 
+  const loadSatLayers = async () => {
+    setSatLoading(true);
+
+    try {
+      const result = await api.satelliteLayers();
+      setSatLayers(result.layers);
+      setSatDetail(result.detail);
+
+      const seen = readSeen();
+      const newly = new Set<string>();
+
+      for (const layer of result.layers) {
+        if (!layer.latest) continue;
+
+        if (!seen[layer.id]) {
+          seen[layer.id] = layer.latest;          // first visit: nothing is "new" yet
+          announced.current[layer.id] = layer.latest;
+          continue;
+        }
+
+        if (layer.latest > seen[layer.id]) {
+          newly.add(layer.id);
+
+          if (announced.current[layer.id] !== layer.latest) {
+            announced.current[layer.id] = layer.latest;
+            toast(
+              `New imagery: ${layer.name} · ${layer.kind === "polar" ? layer.latest : layer.latest.slice(11, 16) + "Z"}`
+            );
+          }
+        }
+      }
+
+      localStorage.setItem(SAT_SEEN_KEY, JSON.stringify(seen));
+      setFresh(newly);
+
+      setSatSelected(current => {
+        if (current && result.layers.some(l => l.id === current)) return current;
+        return result.layers[0]?.id || "";
+      });
+    } catch (err) {
+      setSatDetail(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSatLoading(false);
+    }
+  };
+
+  const acknowledgeLayer = (id: string) => {
+    const layer = satLayers.find(l => l.id === id);
+    if (!layer?.latest) return;
+
+    const seen = readSeen();
+    seen[id] = layer.latest;
+    localStorage.setItem(SAT_SEEN_KEY, JSON.stringify(seen));
+
+    setFresh(old => {
+      const next = new Set(old);
+      next.delete(id);
+      return next;
+    });
+  };
+
+  const loadScenes = async () => {
+    const map = mapRef.current;
+    if (!map || !layersRef.current.scenes) return;
+
+    const ok = map.getZoom() >= 3.2;
+    setZoomOk(ok);
+
+    if (!ok) {
+      setScenes([]);
+      return;
+    }
+
+    const b = map.getBounds();
+    const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    if (bbox[0] >= bbox[2]) return;                 // view crosses the antimeridian
+
+    const seq = ++scenesSeq.current;
+    setScenesBusy(true);
+
+    try {
+      const result = await api.scenes(bbox);
+      if (seq !== scenesSeq.current) return;
+
+      setScenes(result.scenes);
+      setScenesDetail(result.detail);
+
+      const ids = new Set(result.scenes.map(s => s.id));
+
+      if (knownScenes.current) {
+        const added = result.scenes.filter(
+          s => !knownScenes.current!.has(s.id) && Date.now() - Date.parse(s.datetime) < 6 * 3600000
+        );
+        if (added.length) toast(`${added.length} new Sentinel-2 scene${added.length > 1 ? "s" : ""} in view`);
+      }
+
+      knownScenes.current = new Set([...(knownScenes.current || []), ...ids]);
+    } catch (err) {
+      if (seq === scenesSeq.current) setScenesDetail(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (seq === scenesSeq.current) setScenesBusy(false);
+    }
+  };
+
   useEffect(() => {
     void load();
-
-    const timer = window.setInterval(() => {
-      void load();
-    }, 120000);
-
+    const timer = window.setInterval(() => void load(), 60000);
     return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
     void loadMarkets();
-
-    const timer = window.setInterval(() => {
-      void loadMarkets();
-    }, 120000);
-
+    const timer = window.setInterval(() => void loadMarkets(), 30000);
     return () => window.clearInterval(timer);
   }, []);
 
-  // LOCAL SETTINGS
-
   useEffect(() => {
-    localStorage.setItem("sb-layers", JSON.stringify(layers));
-  }, [layers]);
+    void loadSatLayers();
+    const timer = window.setInterval(() => void loadSatLayers(), 5 * 60000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  /* ----------------------------------------------------------- local settings */
+
+  useEffect(() => localStorage.setItem("sb-layers", JSON.stringify(layers)), [layers]);
+  useEffect(() => localStorage.setItem("sb-globe", globe ? "1" : "0"), [globe]);
+  useEffect(() => localStorage.setItem("sb-sat-layer", satSelected), [satSelected]);
+  useEffect(() => localStorage.setItem("sb-sat-opacity", String(satOpacity)), [satOpacity]);
 
   useEffect(() => {
     localStorage.setItem("sb-theme", JSON.stringify(theme));
 
     Object.entries(theme).forEach(([key, value]) => {
-      document.documentElement.style.setProperty(
-        `--sb-${key}`,
-        String(value)
-      );
+      document.documentElement.style.setProperty(`--sb-${key}`, String(value));
     });
   }, [theme]);
 
-  // SATELLITE LAYER
-
-  function addSatelliteLayer(map: MapLibreMap) {
-    if (satelliteAdded.current) return;
-
-    const date = new Date();
-    date.setUTCDate(date.getUTCDate() - 2);
-
-    const imageDate = date.toISOString().slice(0, 10);
-
-    const tileUrl =
-      `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/` +
-      `MODIS_Terra_CorrectedReflectance_TrueColor/default/` +
-      `${imageDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
-
-    try {
-      if (!map.getSource("sb-satellite")) {
-        map.addSource("sb-satellite", {
-          type: "raster",
-          tiles: [tileUrl],
-          tileSize: 256,
-          maxzoom: 9,
-          attribution: "NASA GIBS / NASA Earthdata"
-        });
-      }
-
-      if (!map.getLayer(SATELLITE_LAYER)) {
-        // Insert below the entity layers so markers always stay on top
-        const beforeId = map.getLayer("sb-quakes-layer")
-          ? "sb-quakes-layer"
-          : undefined;
-
-        map.addLayer(
-          {
-            id: SATELLITE_LAYER,
-            type: "raster",
-            source: "sb-satellite",
-            layout: {
-              visibility: "none"
-            },
-            paint: {
-              "raster-opacity": 0.9
-            }
-          },
-          beforeId
-        );
-      }
-
-      satelliteAdded.current = true;
-    } catch (err) {
-      console.error("Satellite layer:", err);
-    }
-  }
-
-  function updateSatelliteVisibility(
-    map: MapLibreMap,
-    visible: boolean
-  ) {
-    if (!map.isStyleLoaded()) return;
-
-    if (!map.getLayer(SATELLITE_LAYER)) {
-      addSatelliteLayer(map);
-    }
-
-    if (map.getLayer(SATELLITE_LAYER)) {
-      map.setLayoutProperty(
-        SATELLITE_LAYER,
-        "visibility",
-        visible ? "visible" : "none"
-      );
-    }
-  }
-
-  // MAP INITIALIZATION
+  /* ------------------------------------------------------------ map creation */
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
 
     const map = new maplibregl.Map({
       container: mapNode.current,
-      style:
-        import.meta.env.VITE_MAP_STYLE ||
-        "https://tiles.openfreemap.org/styles/dark",
+      style: import.meta.env.VITE_MAP_STYLE || "https://tiles.openfreemap.org/styles/dark",
       center: [18, 22],
       zoom: 1.65,
       minZoom: 1.2,
@@ -547,45 +551,27 @@ export default function App() {
       attributionControl: {}
     });
 
-    map.addControl(
-      new maplibregl.NavigationControl({
-        visualizePitch: true
-      }),
-      "top-right"
-    );
-
-    map.addControl(
-      new maplibregl.ScaleControl({
-        unit: "metric"
-      }),
-      "bottom-left"
-    );
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+    map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
 
     map.on("load", () => {
-      // Entity layers first, then satellite beneath them
+      // rasters go UNDER the base map's labels, markers go on top of everything
+      labelBefore.current = map.getStyle().layers.find(l => l.type === "symbol")?.id;
+
       ensureEntityLayers(map);
 
-      satelliteAdded.current = false;
-      addSatelliteLayer(map);
-
-      ENTITY_LAYERS.forEach(({ id }) => {
-        const layerId = `sb-${id}-layer`;
-
+      [...ENTITY_IDS.map(id => `sb-${id}-layer`)].forEach(layerId => {
         map.on("click", layerId, event => {
           const key = event.features?.[0]?.properties?.key;
           const item = key ? entityIndex.current[key] : undefined;
-
           if (item) setSelected(item);
         });
 
-        map.on("mouseenter", layerId, () => {
-          map.getCanvas().style.cursor = "pointer";
-        });
-
-        map.on("mouseleave", layerId, () => {
-          map.getCanvas().style.cursor = "";
-        });
+        map.on("mouseenter", layerId, () => { map.getCanvas().style.cursor = "pointer"; });
+        map.on("mouseleave", layerId, () => { map.getCanvas().style.cursor = ""; });
       });
+
+      map.setProjection({ type: globeRef.current ? "globe" : "mercator" });
 
       setMapError("");
       setMapReady(true);
@@ -596,34 +582,125 @@ export default function App() {
 
       if (!map.isStyleLoaded()) {
         setMapReady(false);
-        setMapError(
-          event.error?.message || "Map style could not be loaded."
-        );
+        setMapError(event.error?.message || "Map style could not be loaded.");
       }
+    });
+
+    let timer = 0;
+    map.on("moveend", () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void loadScenes(), 900);
     });
 
     mapRef.current = map;
 
     return () => {
+      window.clearTimeout(timer);
       map.remove();
       mapRef.current = null;
-      satelliteAdded.current = false;
     };
   }, []);
 
+  // flat map <-> globe
   useEffect(() => {
     const map = mapRef.current;
-
     if (!map || !mapReady) return;
 
-    updateSatelliteVisibility(map, layers.satellite);
-  }, [layers.satellite, mapReady]);
+    map.setProjection({ type: globe ? "globe" : "mercator" });
+  }, [globe, mapReady]);
 
-  // MAP ENTITIES (flights / vessels / earthquakes)
+  /* ------------------------------------------------------ satellite raster */
+
+  const selectedSat = satLayers.find(l => l.id === satSelected) || null;
 
   useEffect(() => {
     const map = mapRef.current;
+    if (!map || !mapReady) return;
 
+    if (map.getLayer(SAT_LAYER)) map.removeLayer(SAT_LAYER);
+    if (map.getSource("sb-satellite")) map.removeSource("sb-satellite");
+
+    if (!layers.satellite || !selectedSat) return;
+
+    map.addSource("sb-satellite", {
+      type: "raster",
+      tiles: [selectedSat.tiles],
+      tileSize: selectedSat.tileSize,
+      maxzoom: selectedSat.maxzoom,
+      attribution: "Imagery: NASA GIBS / ESDIS"
+    });
+
+    const before = map.getLayer(OVERLAY_LAYER)
+      ? OVERLAY_LAYER
+      : labelBefore.current || "sb-quakes-layer";
+
+    map.addLayer(
+      {
+        id: SAT_LAYER,
+        type: "raster",
+        source: "sb-satellite",
+        paint: { "raster-opacity": satOpacity, "raster-fade-duration": 0 }
+      },
+      before
+    );
+  }, [mapReady, layers.satellite, selectedSat?.tiles, selectedSat?.maxzoom]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map && mapReady && map.getLayer(SAT_LAYER)) {
+      map.setPaintProperty(SAT_LAYER, "raster-opacity", satOpacity);
+    }
+  }, [satOpacity, mapReady]);
+
+  // a single Sentinel-2 scene drawn exactly on its footprint
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    if (map.getLayer(OVERLAY_LAYER)) map.removeLayer(OVERLAY_LAYER);
+    if (map.getSource("sb-scene-overlay")) map.removeSource("sb-scene-overlay");
+
+    if (!sceneOverlay?.tiles) return;
+
+    map.addSource("sb-scene-overlay", {
+      type: "raster",
+      tiles: [sceneOverlay.tiles],
+      tileSize: 256,
+      minzoom: 5,
+      maxzoom: 16,
+      bounds: sceneOverlay.bbox,
+      attribution: "Copernicus Sentinel-2 / Microsoft Planetary Computer"
+    });
+
+    map.addLayer(
+      {
+        id: OVERLAY_LAYER,
+        type: "raster",
+        source: "sb-scene-overlay",
+        paint: { "raster-opacity": 1, "raster-fade-duration": 0 }
+      },
+      labelBefore.current || "sb-quakes-layer"
+    );
+  }, [mapReady, sceneOverlay]);
+
+  // scene search when the toggle or the map changes
+  useEffect(() => {
+    if (!mapReady) return;
+
+    if (!layers.scenes) {
+      setScenes([]);
+      return;
+    }
+
+    void loadScenes();
+    const timer = window.setInterval(() => void loadScenes(), 10 * 60000);
+    return () => window.clearInterval(timer);
+  }, [mapReady, layers.scenes]);
+
+  /* ----------------------------------------------------------- map entities */
+
+  useEffect(() => {
+    const map = mapRef.current;
     if (!map || !mapReady) return;
 
     ensureEntityLayers(map);
@@ -631,16 +708,24 @@ export default function App() {
     const index: Record<string, Entity> = {};
     const skipped: Record<string, number> = {};
 
-    const toCollection = <T,>(
-      prefix: EntityLayerId,
+    const collect = <T,>(
+      prefix: string,
       items: T[],
-      coords: (item: T) => [unknown, unknown]
+      read: (item: T) => {
+        pos: [unknown, unknown];
+        shape?: IconShape;
+        color?: string;
+        rot?: number;
+        z?: number;
+      } | null
     ): GeoCollection => {
       const features: GeoFeature[] = [];
 
       items.forEach((item, i) => {
-        const c = validCoord(...coords(item));
+        const r = read(item);
+        if (!r) return;
 
+        const c = validCoord(...r.pos);
         if (!c) {
           skipped[prefix] = (skipped[prefix] || 0) + 1;
           return;
@@ -651,99 +736,138 @@ export default function App() {
 
         features.push({
           type: "Feature",
-          properties: { key },
-          geometry: {
-            type: "Point",
-            coordinates: c
-          }
+          properties: {
+            key,
+            icon: r.shape && r.color ? ensureIcon(map, r.shape, r.color) : "",
+            rot: r.rot ?? 0,
+            z: r.z ?? 0
+          },
+          geometry: { type: "Point", coordinates: c }
         });
       });
 
-      return {
-        type: "FeatureCollection",
-        features
-      };
+      return { type: "FeatureCollection", features };
     };
 
-    const apply = (
-      id: EntityLayerId,
-      data: GeoCollection,
-      visible: boolean,
-      color: string
-    ) => {
-      const source = map.getSource(`sb-${id}`) as
-        | maplibregl.GeoJSONSource
-        | undefined;
-
-      source?.setData(
-        data as unknown as Parameters<maplibregl.GeoJSONSource["setData"]>[0]
-      );
-
-      map.setLayoutProperty(
-        `sb-${id}-layer`,
-        "visibility",
-        visible ? "visible" : "none"
-      );
-
-      map.setPaintProperty(`sb-${id}-layer`, "circle-color", color);
+    const apply = (id: EntityLayerId, data: GeoCollection, visible: boolean) => {
+      const source = map.getSource(`sb-${id}`) as maplibregl.GeoJSONSource | undefined;
+      source?.setData(data as unknown as Parameters<maplibregl.GeoJSONSource["setData"]>[0]);
+      map.setLayoutProperty(`sb-${id}-layer`, "visibility", visible ? "visible" : "none");
     };
 
     apply(
       "flights",
-      toCollection("flights", flights, f => [f.longitude, f.latitude]),
-      layers.flights,
-      theme.aircraft
+      collect("flights", flights, f => {
+        if (f.onGround && f.category !== "military") return null;       // keep airports readable
+
+        const cat = f.category || "commercial";
+        const color = cat === "commercial" ? theme.aircraft : FLIGHT_COLORS[cat];
+        const z = cat === "emergency" ? 4 : cat === "military" ? 3 : cat === "helicopter" ? 2 : cat === "private" ? 0 : 1;
+
+        return {
+          pos: [f.longitude, f.latitude],
+          shape: cat === "helicopter" ? "heli" : "plane",
+          color,
+          rot: f.heading ?? 0,
+          z
+        };
+      }),
+      layers.flights
     );
 
     apply(
       "vessels",
-      toCollection("vessels", vessels, v => [v.longitude, v.latitude]),
-      layers.vessels,
-      theme.vessels
+      collect("vessels", vessels, v => {
+        const cat = v.category || "other";
+        return {
+          pos: [v.longitude, v.latitude],
+          shape: "ship",
+          color: cat === "cargo" ? theme.vessels : VESSEL_COLORS[cat],
+          rot: v.heading ?? v.course ?? 0,
+          z: cat === "military" ? 2 : 0
+        };
+      }),
+      layers.vessels
     );
 
     apply(
-      "quakes",
-      toCollection("quakes", quakes, q => [
-        q.coordinates?.[0],
-        q.coordinates?.[1]
-      ]),
-      layers.earthquakes,
-      theme.earthquakes
+      "conflicts",
+      collect("conflicts", conflicts, c => ({
+        pos: [c.longitude, c.latitude],
+        shape: "conflict",
+        color: theme.conflicts,
+        z: Math.min(5, Math.log10(c.mentions + 1))
+      })),
+      layers.conflicts
     );
+
+    apply(
+      "protests",
+      collect("protests", protests, c => ({
+        pos: [c.longitude, c.latitude],
+        shape: "protest",
+        color: theme.protests,
+        z: Math.min(5, Math.log10(c.mentions + 1))
+      })),
+      layers.protests
+    );
+
+    // satellite icons: Sentinel-2 scenes + geostationary platforms
+    const geo = satLayers.filter(
+      (l, i, arr) => l.kind === "geostationary" && l.center && arr.findIndex(x => x.platform === l.platform) === i
+    );
+
+    const sceneCollection = collect("scenes", scenes, s => ({
+      pos: [s.center[0], s.center[1]],
+      shape: "sat",
+      color: Date.now() - Date.parse(s.datetime) < 6 * 3600000 ? "#3ddc97" : "#7aa88f",
+      z: Date.parse(s.datetime) / 1e12
+    }));
+
+    const geoCollection = collect("geo", geo, l => ({
+      pos: [l.center![0], l.center![1]],
+      shape: "sat",
+      color: fresh.has(l.id) ? "#ffffff" : "#8fa5b3",
+      z: 0
+    }));
+
+    apply("scenes", { type: "FeatureCollection", features: [...sceneCollection.features, ...geoCollection.features] }, layers.scenes);
+
+    // earthquakes (circles)
+    const quakeData: GeoCollection = { type: "FeatureCollection", features: [] };
+
+    quakes.forEach((q, i) => {
+      const c = validCoord(q.coordinates?.[0], q.coordinates?.[1]);
+      if (!c) { skipped.quakes = (skipped.quakes || 0) + 1; return; }
+
+      const key = `quakes:${i}`;
+      index[key] = q;
+      quakeData.features.push({
+        type: "Feature",
+        properties: { key },
+        geometry: { type: "Point", coordinates: c }
+      });
+    });
+
+    apply("quakes", quakeData, layers.earthquakes);
+    map.setPaintProperty("sb-quakes-layer", "circle-color", theme.earthquakes);
 
     entityIndex.current = index;
     setDropped(skipped);
+  }, [mapReady, layers, quakes, flights, vessels, conflicts, protests, scenes, satLayers, fresh, theme]);
 
-    console.debug(
-      "[map] records without valid position:",
-      skipped,
-      "| raw counts:",
-      {
-        flights: flights.length,
-        vessels: vessels.length,
-        quakes: quakes.length
-      }
-    );
-  }, [mapReady, layers, quakes, flights, vessels, theme]);
-
-  // NEWS
+  /* ------------------------------------------------------------------- news */
 
   const allNews = useMemo(() => {
-    const combined = [...news, ...events];
     const unique = new Map<string, FeedItem>();
 
-    combined.forEach(item => {
+    [...news, ...events].forEach(item => {
       const key = item.url || item.title;
-
-      if (!unique.has(key)) {
-        unique.set(key, item);
-      }
+      if (!unique.has(key)) unique.set(key, item);
     });
 
-    return [...unique.values()].sort((a, b) =>
-      new Date(b.publishedAt || 0).getTime() -
-      new Date(a.publishedAt || 0).getTime()
+    return [...unique.values()].sort(
+      (a, b) => new Date(b.publishedAt || 0).getTime() - new Date(a.publishedAt || 0).getTime()
     );
   }, [news, events]);
 
@@ -751,73 +875,61 @@ export default function App() {
     const value = query.toLowerCase();
 
     return allNews.filter(item =>
-      `${item.title} ${item.source} ${item.summary || ""}`
-        .toLowerCase()
-        .includes(value)
+      `${item.title} ${item.source} ${item.summary || ""}`.toLowerCase().includes(value)
     );
   }, [allNews, query]);
 
-  const tickerItems = useMemo(
-    () => allNews.slice(0, 20),
-    [allNews]
+  const tickerItems = useMemo(() => allNews.slice(0, 20), [allNews]);
+
+  const alerts = useMemo<AlertItem[]>(
+    () =>
+      [
+        ...quakes
+          .filter(quake => quake.magnitude >= 4.5)
+          .map(quake => ({
+            id: quake.id,
+            title: `Magnitude ${quake.magnitude.toFixed(1)} earthquake`,
+            detail: quake.place,
+            time: quake.time
+          })),
+
+        ...events.map(item => ({
+          id: item.id,
+          title: item.title,
+          detail: item.source,
+          time: item.publishedAt ? new Date(item.publishedAt).getTime() : 0
+        }))
+      ]
+        .sort((a, b) => b.time - a.time)
+        .slice(0, 50),
+    [quakes, events]
   );
 
-  // ALERTS
+  /* ---------------------------------------------------------------- helpers */
 
-  const alerts = useMemo<AlertItem[]>(() => [
-    ...quakes
-      .filter(quake => quake.magnitude >= 4.5)
-      .map(quake => ({
-        id: quake.id,
-        title: `Magnitude ${quake.magnitude.toFixed(1)} earthquake`,
-        detail: quake.place,
-        time: quake.time
-      })),
+  const toggle = (key: keyof LayerState) => setLayers(value => ({ ...value, [key]: !value[key] }));
 
-    ...events.map(item => ({
-      id: item.id,
-      title: item.title,
-      detail: item.source,
-      time: item.publishedAt
-        ? new Date(item.publishedAt).getTime()
-        : 0
-    }))
-  ]
-    .sort((a, b) => b.time - a.time)
-    .slice(0, 50), [quakes, events]);
+  const isConflict = (v: Entity): v is ConflictCluster => "events" in v && "mentions" in v;
+  const isScene = (v: Entity): v is SatelliteScene => "footprint" in v;
+  const isSatLayer = (v: Entity): v is SatelliteLayerInfo => "cadence" in v && "tiles" in v;
+  const isFeed = (v: Entity): v is FeedItem => "source" in v && "url" in v && "title" in v && "category" in v;
+  const isVessel = (v: Entity): v is Vessel => "mmsi" in v;
 
-  // FILTERED MARKETS
+  const pickScene = (scene: SatelliteScene) => {
+    setSceneOverlay(scene);
+    setSelected(scene);
 
-  const filteredMarkets = useMemo(() => {
-    if (marketFilter === "all") return marketItems;
-
-    return marketItems.filter(
-      item => item.category === marketFilter
-    );
-  }, [marketItems, marketFilter]);
-
-  const marketCounts = useMemo(() => ({
-    all: marketItems.length,
-    crypto: marketItems.filter(item => item.category === "crypto").length,
-    forex: marketItems.filter(item => item.category === "forex").length,
-    commodity: marketItems.filter(item => item.category === "commodity").length,
-    stock: marketItems.filter(item => item.category === "stock").length
-  }), [marketItems]);
-
-  // HELPERS
-
-  const toggle = (key: keyof LayerState) => {
-    setLayers(value => ({
-      ...value,
-      [key]: !value[key]
-    }));
+    const map = mapRef.current;
+    if (map) {
+      map.flyTo({ center: scene.center, zoom: Math.max(map.getZoom(), 7.5) });
+    }
   };
 
-  const isFeed = (value: Entity): value is FeedItem =>
-    "source" in value && "url" in value;
-
-  const isVessel = (value: Entity): value is Vessel =>
-    "mmsi" in value;
+  const selectSatLayer = (id: string) => {
+    setSatSelected(id);
+    setLayers(old => ({ ...old, satellite: true }));
+    acknowledgeLayer(id);
+  };
 
   const addNewsSource = async () => {
     setSourceMessage("");
@@ -830,19 +942,14 @@ export default function App() {
       });
 
       setSourceMessage(`Added ${result.source.name}`);
-
       setNewSourceName("");
       setNewSourceUrl("");
 
       const updated = await api.sources();
       setSources(updated.items);
-
       await load();
-
     } catch (err: unknown) {
-      setSourceMessage(
-        err instanceof Error ? err.message : String(err)
-      );
+      setSourceMessage(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -852,165 +959,138 @@ export default function App() {
 
       const updated = await api.sources();
       setSources(updated.items);
-
       await load();
-
     } catch (err: unknown) {
-      setSourceMessage(
-        err instanceof Error ? err.message : String(err)
-      );
+      setSourceMessage(err instanceof Error ? err.message : String(err));
     }
   };
 
-  const setColor = (
-    key: keyof Theme,
-    value: string
-  ) => {
-    setTheme((old: Theme) => ({
-      ...old,
-      [key]: value
-    }));
-  };
+  const setColor = (key: keyof Theme, value: string) => setTheme((old: Theme) => ({ ...old, [key]: value }));
 
-  const setSatelliteMode = () => {
-    setLayers(old => ({
-      ...old,
-      satellite: !old.satellite
-    }));
-  };
-
-  const layerDetail = (
-    count: number,
-    word: string,
-    info: string,
-    skipped?: number
-  ) => {
+  const layerDetail = (count: number, word: string, info: string, skipped?: number) => {
     if (!count) return info || "no data";
-
-    return skipped
-      ? `${count} ${word} · ${skipped} no position`
-      : `${count} ${word}`;
+    return skipped ? `${count} ${word} · ${skipped} no position` : `${count} ${word}`;
   };
 
-  // RENDER
+  const flightsOnMap = flights.filter(f => !(f.onGround && f.category !== "military")).length;
+  const militaryCount = flights.filter(f => f.category === "military").length;
+
+  /* ------------------------------------------------------------------ render */
 
   return (
     <div className="app-shell">
-
       <header className="topbar">
-
         <button
           className="icon-button mobile-only"
           onClick={() => setMobilePanel(!mobilePanel)}
           aria-label="Menu"
         >
-          <Menu size={19}/>
+          <Menu size={19} />
         </button>
 
         <div className="brand">
           <div className="brand-mark">
-            <Shield size={19}/>
+            <Shield size={19} />
           </div>
 
           <div>
             <div className="brand-name">
               SHADOW<span>BROKER</span>
             </div>
-
-            <div className="brand-sub">
-              GLOBAL INTELLIGENCE PLATFORM
-            </div>
+            <div className="brand-sub">GLOBAL INTELLIGENCE PLATFORM</div>
           </div>
         </div>
 
         <nav className="main-navigation">
-
-          <button
-            className={activeTab === "news" ? "active" : ""}
-            onClick={() => setActiveTab("news")}
-          >
-            <Globe2 size={15}/> WORLD
+          <button className={activeTab === "news" ? "active" : ""} onClick={() => setActiveTab("news")}>
+            <Globe2 size={15} /> WORLD
           </button>
 
-          <button
-            className={activeTab === "sources" ? "active" : ""}
-            onClick={() => setActiveTab("sources")}
-          >
-            <Newspaper size={15}/> SOURCES
+          <button className={activeTab === "satellite" ? "active" : ""} onClick={() => setActiveTab("satellite")}>
+            <Satellite size={15} /> SATELLITE
           </button>
 
-          <button
-            className={activeTab === "markets" ? "active" : ""}
-            onClick={() => setActiveTab("markets")}
-          >
-            <ChartNoAxesCombined size={15}/> MARKETS
+          <button className={activeTab === "markets" ? "active" : ""} onClick={() => setActiveTab("markets")}>
+            <ChartNoAxesCombined size={15} /> MARKETS
           </button>
 
+          <button className={activeTab === "sources" ? "active" : ""} onClick={() => setActiveTab("sources")}>
+            <Radio size={15} /> SOURCES
+          </button>
         </nav>
 
         <div className="top-status">
-          <span className="live-dot"/>
+          <span className="live-dot" />
           GLOBAL MONITOR
-          <span className="status-divider"/>
-          {lastUpdated
-            ? `UPDATED ${lastUpdated.toLocaleTimeString()}`
-            : "CONNECTING"}
+          <span className="status-divider" />
+          {lastUpdated ? `UPDATED ${lastUpdated.toLocaleTimeString()}` : "CONNECTING"}
         </div>
 
         <div className="top-actions">
-
           <button
             className="icon-button"
             onClick={() => {
               void load();
               void loadMarkets();
+              void loadSatLayers();
             }}
             title="Refresh"
           >
-            <RefreshCw
-              size={17}
-              className={busy || marketLoading ? "spin" : ""}
-            />
+            <RefreshCw size={17} className={busy || marketLoading ? "spin" : ""} />
           </button>
 
-          <button
-            className="icon-button"
-            onClick={() => setActiveTab("settings")}
-            title="Appearance"
-          >
-            <Palette size={17}/>
+          <button className="icon-button" onClick={() => setActiveTab("settings")} title="Appearance">
+            <Palette size={17} />
           </button>
-
         </div>
       </header>
 
       <main className="workspace">
-
         <aside className={`left-rail ${mobilePanel ? "show" : ""}`}>
-
           <div className="rail-heading">
             <span>INTELLIGENCE LAYERS</span>
-            <Layers size={15}/>
+            <Layers size={15} />
           </div>
 
           <div className="layer-list">
-
             <Layer
-              icon={<Plane size={16}/>}
+              icon={<Plane size={16} />}
               name="Aircraft"
-              detail={layerDetail(
-                flights.length,
-                "tracked",
-                flightInfo,
-                dropped.flights
-              )}
+              detail={layerDetail(flightsOnMap, `airborne · ${militaryCount} mil`, flightInfo, dropped.flights)}
               checked={layers.flights}
               onClick={() => toggle("flights")}
               color="blue"
             />
 
             <Layer
-              icon={<Activity size={16}/>}
+              icon={<Anchor size={16} />}
+              name="Maritime / AIS"
+              detail={layerDetail(vessels.length, "vessels", vesselInfo, dropped.vessels)}
+              checked={layers.vessels}
+              onClick={() => toggle("vessels")}
+              color="cyan"
+            />
+
+            <Layer
+              icon={<AlertTriangle size={16} />}
+              name="Conflicts"
+              detail={conflicts.length ? `${conflicts.length} hotspots · 24 h` : conflictInfo || "loading…"}
+              checked={layers.conflicts}
+              onClick={() => toggle("conflicts")}
+              color="red"
+            />
+
+            <Layer
+              icon={<Radio size={16} />}
+              name="Protests"
+              detail={protests.length ? `${protests.length} locations · 24 h` : conflictInfo || "loading…"}
+              checked={layers.protests}
+              onClick={() => toggle("protests")}
+              color="purple"
+            />
+
+            <Layer
+              icon={<Activity size={16} />}
               name="Earthquakes"
               detail={`${quakes.length} events`}
               checked={layers.earthquakes}
@@ -1019,185 +1099,236 @@ export default function App() {
             />
 
             <Layer
-              icon={<AlertTriangle size={16}/>}
-              name="Conflicts"
-              detail="GDELT reports"
-              checked={layers.conflicts}
-              onClick={() => toggle("conflicts")}
-              color="red"
-            />
-
-            <Layer
-              icon={<Radio size={16}/>}
-              name="Protests"
-              detail="GDELT reports"
-              checked={layers.protests}
-              onClick={() => toggle("protests")}
-              color="purple"
-            />
-
-            <Layer
-              icon={<Anchor size={16}/>}
-              name="Maritime / AIS"
-              detail={layerDetail(
-                vessels.length,
-                "vessels",
-                vesselInfo,
-                dropped.vessels
-              )}
-              checked={layers.vessels}
-              onClick={() => toggle("vessels")}
-              color="cyan"
-            />
-
-            <Layer
-              icon={<Satellite size={16}/>}
+              icon={<Satellite size={16} />}
               name="Satellite imagery"
-              detail={layers.satellite ? "NASA GIBS" : "Dark map"}
+              detail={layers.satellite ? selectedSat?.name || "NASA GIBS" : "off · pick in SAT tab"}
               checked={layers.satellite}
-              onClick={setSatelliteMode}
+              onClick={() => {
+                toggle("satellite");
+                if (!layers.satellite) setActiveTab("satellite");
+              }}
               color="green"
             />
 
+            <Layer
+              icon={<Sparkles size={16} />}
+              name="New scene icons"
+              detail={`${scenes.length} Sentinel-2 in view`}
+              checked={layers.scenes}
+              onClick={() => toggle("scenes")}
+              color="green"
+            />
+
+            <Layer
+              icon={<Globe size={16} />}
+              name="Globe view"
+              detail={globe ? "3D sphere" : "flat map"}
+              checked={globe}
+              onClick={() => setGlobe(g => !g)}
+              color="blue"
+            />
+          </div>
+
+          <div className="rail-heading section-gap">
+            <span>LEGEND</span>
+          </div>
+
+          <div className="legend">
+            {FLIGHT_LEGEND.map(l => (
+              <span key={l.key}>
+                <img
+                  src={iconDataUrl(l.shape, l.key === "commercial" ? theme.aircraft : FLIGHT_COLORS[l.key])}
+                  alt=""
+                />
+                {l.label}
+              </span>
+            ))}
+
+            {VESSEL_LEGEND.map(l => (
+              <span key={l.key}>
+                <img
+                  src={iconDataUrl("ship", l.key === "cargo" ? theme.vessels : VESSEL_COLORS[l.key])}
+                  alt=""
+                />
+                {l.label}
+              </span>
+            ))}
+
+            <span><img src={iconDataUrl("conflict", theme.conflicts)} alt="" />Conflict</span>
+            <span><img src={iconDataUrl("protest", theme.protests)} alt="" />Protest</span>
+            <span><img src={iconDataUrl("sat", "#3ddc97")} alt="" />New imagery</span>
           </div>
 
           <div className="rail-heading section-gap">
             <span>MAP CONTROLS</span>
-            <Crosshair size={15}/>
+            <Crosshair size={15} />
           </div>
 
           <div className="map-controls">
-
-            <button
-              onClick={() =>
-                mapRef.current?.flyTo({
-                  center: [18, 22],
-                  zoom: 1.65
-                })
-              }
-            >
-              <Globe2 size={15}/>
+            <button onClick={() => mapRef.current?.flyTo({ center: [18, 22], zoom: 1.65 })}>
+              <Globe2 size={15} />
               Reset global view
             </button>
 
             <button
               onClick={() =>
-                mapRef.current?.easeTo({
-                  zoom: Math.min(
-                    (mapRef.current?.getZoom() || 1) + 1,
-                    16
-                  )
-                })
+                mapRef.current?.easeTo({ zoom: Math.min((mapRef.current?.getZoom() || 1) + 1, 16) })
               }
             >
-              <Search size={15}/>
+              <Search size={15} />
               Zoom in
             </button>
-
           </div>
 
           <div className="rail-foot">
-            <span className="tiny-led"/>
+            <span className="tiny-led" />
             PUBLIC DATA
-            <span className="foot-right">v2.1.0</span>
+            <span className="foot-right">v3.0.0</span>
           </div>
-
         </aside>
 
         <section className="map-section">
-
           <div className="map-title">
             <div>
-              <span className="eyebrow">
-                GLOBAL SITUATIONAL AWARENESS
-              </span>
+              <span className="eyebrow">GLOBAL SITUATIONAL AWARENESS</span>
               <h1>World monitor</h1>
             </div>
 
             <div className="map-coords">
-              GLOBAL VIEW <span>•</span> WGS84
+              {globe ? "GLOBE" : "FLAT"} VIEW <span>•</span> WGS84
             </div>
           </div>
 
           <div className="map-wrap">
-
-            <div
-              ref={mapNode}
-              className="map-canvas"
-            />
+            <div ref={mapNode} className="map-canvas" />
 
             {!mapReady && (
               <div className="map-loading">
-                <RefreshCw size={20} className="spin"/>
-                <span>
-                  {mapError ? "MAP UNAVAILABLE" : "INITIALIZING MAP"}
-                </span>
-                {mapError && (
-                  <small>{mapError}</small>
-                )}
+                <RefreshCw size={20} className="spin" />
+                <span>{mapError ? "MAP UNAVAILABLE" : "INITIALIZING MAP"}</span>
+                {mapError && <small>{mapError}</small>}
               </div>
             )}
 
-            {mapReady && mapError && (
-              <div className="map-error">
-                MAP WARNING: {mapError}
-              </div>
-            )}
+            {mapReady && mapError && <div className="map-error">MAP WARNING: {mapError}</div>}
 
             <div className="map-overlay map-overlay-top">
-
               <span className={`map-chip ${mapReady ? "online" : "offline"}`}>
-                <span className="live-dot"/>
+                <span className="live-dot" />
                 {mapReady ? "MAP ONLINE" : "MAP OFFLINE"}
               </span>
 
               <span className="map-chip">
-                {layers.satellite
-                  ? "NASA SATELLITE"
-                  : "DARK MAP"}
+                {layers.satellite && selectedSat ? selectedSat.name.toUpperCase() : "DARK MAP"}
+                {layers.satellite && selectedSat?.latest && selectedSat.kind === "geostationary"
+                  ? ` · ${ago(selectedSat.latest)}`
+                  : ""}
               </span>
+            </div>
 
+            <button
+              className="globe-toggle"
+              onClick={() => setGlobe(g => !g)}
+              title={globe ? "Switch to flat map" : "Switch to globe"}
+            >
+              <Globe size={16} />
+              {globe ? "FLAT" : "GLOBE"}
+            </button>
+
+            <div className="map-toasts">
+              {toasts.map(t => (
+                <div className="map-toast" key={t.id}>
+                  <Sparkles size={14} />
+                  {t.text}
+                </div>
+              ))}
             </div>
 
             <div className="map-overlay map-overlay-bottom">
-              <span>SELECT A POINT TO INSPECT</span>
+              <span>SELECT AN ICON TO INSPECT</span>
 
               <span>
-                {flights.length} AIRCRAFT ·{" "}
-                {vessels.length} VESSELS ·{" "}
-                {quakes.length} SEISMIC EVENTS
+                {flightsOnMap} AIRCRAFT · {vessels.length} VESSELS · {conflicts.length + protests.length} UNREST ·{" "}
+                {quakes.length} SEISMIC
               </span>
             </div>
 
             {selected && (
               <div className="inspector">
-
-                <button
-                  className="close-inspector"
-                  onClick={() => setSelected(null)}
-                >
-                  <X size={16}/>
+                <button className="close-inspector" onClick={() => setSelected(null)}>
+                  <X size={16} />
                 </button>
 
-                <div className="eyebrow">
-                  ENTITY INSPECTOR
-                </div>
+                <div className="eyebrow">ENTITY INSPECTOR</div>
 
-                {isFeed(selected) ? (
+                {isConflict(selected) ? (
+                  <>
+                    <h3>
+                      {selected.label} — {selected.place || "unknown place"}
+                    </h3>
+                    <p>
+                      {selected.events} report{selected.events > 1 ? "s" : ""} · {selected.mentions} mentions in the
+                      last 24 h · tone {selected.tone}
+                    </p>
+                    <div className="inspector-meta">
+                      Last event {timeLabel(selected.lastEvent)} · location precision: {selected.precision}
+                      <br />
+                      Location is where the news places the event (GDELT), not a surveyed position.
+                    </div>
+                    {selected.sources.map(u => (
+                      <a key={u} href={u} target="_blank" rel="noreferrer">
+                        {new URL(u).hostname} ↗
+                      </a>
+                    ))}
+                  </>
+                ) : isScene(selected) ? (
+                  <>
+                    <h3>
+                      {selected.platform} · {selected.tile || "scene"}
+                    </h3>
+                    {selected.preview && (
+                      <img className="scene-preview" src={selected.preview} alt="Sentinel-2 preview" loading="lazy" />
+                    )}
+                    <div className="inspector-meta">
+                      Captured {timeLabel(selected.datetime)} ({ago(selected.datetime)})
+                      <br />
+                      Cloud cover {selected.cloud ?? "?"}% · 10 m true colour
+                    </div>
+                    <div className="inspector-actions">
+                      {sceneOverlay?.id === selected.id ? (
+                        <button className="primary-action" onClick={() => setSceneOverlay(null)}>
+                          Remove overlay
+                        </button>
+                      ) : (
+                        <button className="primary-action" onClick={() => pickScene(selected)}>
+                          Overlay on map
+                        </button>
+                      )}
+                    </div>
+                  </>
+                ) : isSatLayer(selected) ? (
+                  <>
+                    <h3>{selected.name}</h3>
+                    <p>{selected.description}</p>
+                    <div className="inspector-meta">
+                      {selected.cadence} · {selected.resolution}
+                      <br />
+                      Latest image: {selected.latest ? `${selected.latest} (${ago(selected.latest)})` : "unknown"}
+                    </div>
+                    <div className="inspector-actions">
+                      <button className="primary-action" onClick={() => selectSatLayer(selected.id)}>
+                        Show this imagery
+                      </button>
+                    </div>
+                  </>
+                ) : isFeed(selected) ? (
                   <>
                     <h3>{selected.title}</h3>
                     <p>{selected.summary}</p>
-
                     <div className="inspector-meta">
-                      {selected.source} ·{" "}
-                      {timeLabel(selected.publishedAt)}
+                      {selected.source} · {timeLabel(selected.publishedAt)}
                     </div>
-
-                    <a
-                      href={selected.url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
+                    <a href={selected.url} target="_blank" rel="noreferrer">
                       OPEN ORIGINAL SOURCE ↗
                     </a>
                   </>
@@ -1205,109 +1336,80 @@ export default function App() {
                   <>
                     <h3>{selected.title}</h3>
                     <p>{selected.place}</p>
-
                     <div className="inspector-meta">
-                      Magnitude {selected.magnitude} ·{" "}
-                      {timeLabel(
-                        new Date(selected.time).toISOString()
-                      )}
+                      Magnitude {selected.magnitude} · {timeLabel(new Date(selected.time).toISOString())}
                     </div>
-
-                    <a
-                      href={selected.url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
+                    <a href={selected.url} target="_blank" rel="noreferrer">
                       USGS EVENT ↗
                     </a>
                   </>
                 ) : isVessel(selected) ? (
                   <>
                     <h3>{selected.name}</h3>
-                    <p>MMSI: {selected.mmsi}</p>
-
+                    <p>
+                      MMSI {selected.mmsi} · {(selected.category || "other").toUpperCase()}
+                      {selected.destination ? ` → ${selected.destination}` : ""}
+                    </p>
                     <div className="inspector-meta">
-                      Speed: {selected.speed ?? "—"} knots ·{" "}
-                      Heading: {selected.heading ?? "—"}
+                      Speed {selected.speed ?? "—"} kn · Heading {selected.heading ?? "—"}°
+                      <br />
+                      Source: {selected.source || "AIS"}
+                      {selected.updatedAt ? ` · ${ago(new Date(selected.updatedAt).toISOString())}` : ""}
                     </div>
                   </>
                 ) : (
                   <>
-                    <h3>
-                      {selected.callsign || selected.icao24}
-                    </h3>
-
-                    <p>{selected.originCountry}</p>
-
+                    <h3>{(selected as Flight).callsign || (selected as Flight).icao24}</h3>
+                    <p>
+                      {((selected as Flight).category || "commercial").toUpperCase()}
+                      {(selected as Flight).aircraftType ? ` · ${(selected as Flight).aircraftType}` : ""}
+                      {(selected as Flight).registration ? ` · ${(selected as Flight).registration}` : ""}
+                      {(selected as Flight).originCountry ? ` · ${(selected as Flight).originCountry}` : ""}
+                    </p>
                     <div className="inspector-meta">
-                      Altitude {selected.altitude ?? "—"} m ·{" "}
-                      Speed {selected.velocity ?? "—"} m/s
+                      Altitude {(selected as Flight).altitude ?? "—"} m ({m2ft((selected as Flight).altitude) ?? "—"} ft)
+                      <br />
+                      Speed {ms2kt((selected as Flight).velocity) ?? "—"} kn · Heading {(selected as Flight).heading ?? "—"}°
+                      {(selected as Flight).squawk ? ` · squawk ${(selected as Flight).squawk}` : ""}
                     </div>
                   </>
                 )}
-
               </div>
             )}
-
           </div>
 
           <div className="map-footer">
-            <span>
-              <span className="legend-dot blue"/>
-              Aircraft
-            </span>
-
-            <span>
-              <span className="legend-dot amber"/>
-              Earthquakes
-            </span>
-
-            <span>
-              <span className="legend-dot red"/>
-              Conflicts
-            </span>
-
-            <span>
-              <span className="legend-dot purple"/>
-              Protests
-            </span>
-
-            <span>
-              <span className="legend-dot cyan"/>
-              Vessels
-            </span>
-
-            <span className="map-footer-right">
-              NASA GIBS / OpenFreeMap
-            </span>
+            <span><span className="legend-dot blue" />Aircraft</span>
+            <span><span className="legend-dot cyan" />Vessels</span>
+            <span><span className="legend-dot red" />Conflicts</span>
+            <span><span className="legend-dot purple" />Protests</span>
+            <span><span className="legend-dot amber" />Earthquakes</span>
+            <span className="map-footer-right">NASA GIBS / Sentinel-2 / OpenFreeMap</span>
           </div>
-
         </section>
 
         <aside className="right-panel">
-
           <div className="panel-tabs">
-
-            <button
-              className={activeTab === "news" ? "active" : ""}
-              onClick={() => setActiveTab("news")}
-            >
-              <Newspaper size={15}/> NEWS
+            <button className={activeTab === "news" ? "active" : ""} onClick={() => setActiveTab("news")}>
+              <Newspaper size={15} /> NEWS
             </button>
 
-            <button
-              className={activeTab === "alerts" ? "active" : ""}
-              onClick={() => setActiveTab("alerts")}
-            >
-              <Bell size={15}/> ALERTS
+            <button className={activeTab === "alerts" ? "active" : ""} onClick={() => setActiveTab("alerts")}>
+              <Bell size={15} /> ALERTS
               <span className="tab-count">{alerts.length}</span>
             </button>
 
             <button
-              className={activeTab === "sources" ? "active" : ""}
-              onClick={() => setActiveTab("sources")}
+              className={activeTab === "satellite" ? "active" : ""}
+              onClick={() => setActiveTab("satellite")}
+              title="Satellite imagery"
             >
-              <Radio size={15}/> SOURCES
+              <Satellite size={15} /> SAT
+              {fresh.size > 0 && <span className="tab-count fresh">{fresh.size}</span>}
+            </button>
+
+            <button className={activeTab === "sources" ? "active" : ""} onClick={() => setActiveTab("sources")}>
+              <Radio size={15} /> SRC
             </button>
 
             <button
@@ -1315,7 +1417,7 @@ export default function App() {
               onClick={() => setActiveTab("markets")}
               title="Markets"
             >
-              <ChartNoAxesCombined size={15}/>
+              <ChartNoAxesCombined size={15} />
             </button>
 
             <button
@@ -1323,9 +1425,8 @@ export default function App() {
               onClick={() => setActiveTab("settings")}
               title="Settings"
             >
-              <Settings2 size={15}/>
+              <Settings2 size={15} />
             </button>
-
           </div>
 
           {activeTab === "news" && (
@@ -1437,9 +1538,33 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === "satellite" && (
+            <SatellitePanel
+              layers={satLayers}
+              detail={satDetail}
+              loading={satLoading}
+              imageryOn={layers.satellite}
+              onToggleImagery={() => toggle("satellite")}
+              selectedId={satSelected}
+              onSelect={selectSatLayer}
+              opacity={satOpacity}
+              onOpacity={setSatOpacity}
+              fresh={fresh}
+              scenesOn={layers.scenes}
+              onToggleScenes={() => toggle("scenes")}
+              scenes={scenes}
+              scenesDetail={scenesDetail}
+              scenesBusy={scenesBusy}
+              zoomOk={zoomOk}
+              overlayId={sceneOverlay?.id || null}
+              onPickScene={pickScene}
+              onClearOverlay={() => setSceneOverlay(null)}
+              onRefresh={() => void loadSatLayers()}
+            />
+          )}
+
           {activeTab === "sources" && (
             <div className="panel-content">
-
               <div className="panel-intro">
                 <div>
                   <div className="eyebrow">CONNECTIVITY</div>
@@ -1447,46 +1572,38 @@ export default function App() {
                 </div>
               </div>
 
-              {error && (
-                <div className="inline-warning">{error}</div>
-              )}
+              {error && <div className="inline-warning">{error}</div>}
 
               <div className="source-list">
-
-                {Object.entries(serviceStatus).map(
-                  ([name, status]) => (
-                    <div className="source-row" key={name}>
-                      <div>
-                        <strong>{name}</strong>
-                        <p>{status.detail}</p>
-                      </div>
-
-                      <span className={`source-state ${status.status}`}>
-                        {status.status.replaceAll("_", " ")}
-                      </span>
+                {Object.entries(serviceStatus).map(([name, status]) => (
+                  <div className="source-row" key={name}>
+                    <div>
+                      <strong>{name}</strong>
+                      <p>{status.detail}</p>
                     </div>
-                  )
-                )}
 
+                    <span className={`source-state ${status.status}`}>
+                      {status.status.replaceAll("_", " ")}
+                    </span>
+                  </div>
+                ))}
               </div>
 
               <div className="source-note">
                 <strong>Live layer diagnostics</strong>
-
                 <p>
                   Aircraft: {flights.length} received
-                  {dropped.flights
-                    ? `, ${dropped.flights} without valid position`
-                    : ""}
+                  {dropped.flights ? `, ${dropped.flights} without valid position` : ""}
                   {flightInfo ? ` — ${flightInfo}` : ""}
                 </p>
-
                 <p>
                   Vessels: {vessels.length} received
-                  {dropped.vessels
-                    ? `, ${dropped.vessels} without valid position`
-                    : ""}
+                  {dropped.vessels ? `, ${dropped.vessels} without valid position` : ""}
                   {vesselInfo ? ` — ${vesselInfo}` : ""}
+                </p>
+                <p>
+                  Unrest: {conflicts.length} conflict + {protests.length} protest locations
+                  {conflictInfo ? ` — ${conflictInfo}` : ""}
                 </p>
               </div>
 
@@ -1503,10 +1620,7 @@ export default function App() {
 
               <div className="source-note">
                 <strong>Data integrity</strong>
-                <p>
-                  Unavailable providers are not replaced with
-                  invented live positions.
-                </p>
+                <p>Unavailable providers are never replaced with invented positions or prices.</p>
               </div>
 
               <div className="source-manager">
@@ -1572,159 +1686,13 @@ export default function App() {
           )}
 
           {activeTab === "markets" && (
-            <div className="panel-content markets-panel">
-
-              <div className="panel-intro">
-                <div>
-                  <div className="eyebrow">GLOBAL FINANCIAL DATA</div>
-                  <h2>Market monitor</h2>
-                </div>
-
-                <button
-                  className="market-refresh"
-                  onClick={() => void loadMarkets()}
-                  title="Refresh market data"
-                >
-                  <RefreshCw
-                    size={16}
-                    className={marketLoading ? "spin" : ""}
-                  />
-                </button>
-              </div>
-
-              <div className="market-summary">
-                <div className="market-summary-icon">
-                  <ChartNoAxesCombined size={20}/>
-                </div>
-
-                <div>
-                  <strong>{marketItems.length}</strong>
-                  <span>MARKET INSTRUMENTS</span>
-                </div>
-
-                <div className="market-summary-status">
-                  <span className="live-dot"/>
-                  {marketLoading ? "UPDATING" : "DATA FEED"}
-                </div>
-              </div>
-
-              <div className="market-filters">
-                {marketFilters.map(filter => (
-                  <button
-                    key={filter.id}
-                    className={marketFilter === filter.id ? "active" : ""}
-                    onClick={() => setMarketFilter(filter.id)}
-                  >
-                    {filter.label}
-                    <span>{marketCounts[filter.id]}</span>
-                  </button>
-                ))}
-              </div>
-
-              {marketError && (
-                <div className="inline-warning">
-                  {marketError}
-                </div>
-              )}
-
-              <div className="market-list">
-
-                {filteredMarkets.map((item, index) => (
-                  <div
-                    className="market-item"
-                    key={`${item.symbol}-${index}`}
-                  >
-                    <div className="market-item-main">
-                      <div className={`market-icon ${item.category}`}>
-                        {item.category === "crypto" ? (
-                          <Coins size={17}/>
-                        ) : item.category === "forex" ? (
-                          <CircleDollarSign size={17}/>
-                        ) : (
-                          <TrendingUp size={17}/>
-                        )}
-                      </div>
-
-                      <div className="market-name">
-                        <strong>{item.symbol}</strong>
-                        <span>{item.name}</span>
-                      </div>
-                    </div>
-
-                    <div className="market-item-values">
-                      <strong>
-                        {formatPrice(item.price, item.currency)}
-                      </strong>
-
-                      <span
-                        className={
-                          item.change24h === undefined ||
-                          item.change24h === null
-                            ? ""
-                            : item.change24h >= 0
-                              ? "positive"
-                              : "negative"
-                        }
-                      >
-                        {item.change24h !== undefined &&
-                        item.change24h !== null ? (
-                          item.change24h >= 0
-                            ? <TrendingUp size={12}/>
-                            : <TrendingDown size={12}/>
-                        ) : null}
-
-                        {formatChange(item.change24h)}
-                      </span>
-                    </div>
-
-                    <div className="market-item-meta">
-                      <span>{item.category.toUpperCase()}</span>
-                      <span>{item.source}</span>
-                    </div>
-                  </div>
-                ))}
-
-                {!filteredMarkets.length && (
-                  <div className="empty-state">
-                    {marketLoading
-                      ? "Loading market data..."
-                      : "No market data available for this category."}
-                  </div>
-                )}
-
-              </div>
-
-              <div className="market-provider-list">
-                <div className="eyebrow">PROVIDER STATUS</div>
-
-                {Object.entries(marketServices).map(
-                  ([name, status]) => (
-                    <div className="market-provider" key={name}>
-                      <span>{name}</span>
-
-                      <span className={`source-state ${status.status}`}>
-                        {status.status.replaceAll("_", " ")}
-                      </span>
-                    </div>
-                  )
-                )}
-              </div>
-
-              <div className="source-note market-disclaimer">
-                <strong>Market data notes</strong>
-                <p>
-                  Cryptocurrency prices are sourced from Binance.
-                  Forex values are daily reference rates, not live
-                  trading quotes. Commodity availability depends on
-                  the configured provider.
-                </p>
-                <p>
-                  This dashboard displays market data and does not
-                  provide investment recommendations.
-                </p>
-              </div>
-
-            </div>
+            <MarketsPanel
+              items={marketItems}
+              services={marketServices}
+              loading={marketLoading}
+              error={marketError}
+              onRefresh={() => void loadMarkets()}
+            />
           )}
 
           {activeTab === "settings" && (
@@ -1768,23 +1736,17 @@ export default function App() {
           )}
 
           <div className="panel-bottom">
-            <span className="tiny-led"/>
+            <span className="tiny-led" />
             PUBLIC DATA SOURCES
             <span>·</span>
             {busy || marketLoading ? "UPDATING" : "MONITORING"}
           </div>
-
         </aside>
-
       </main>
 
       <div className="breaking-ticker">
-
-        <button
-          className="ticker-label"
-          onClick={() => setTickerPaused(!tickerPaused)}
-        >
-          <span className="ticker-live"/>
+        <button className="ticker-label" onClick={() => setTickerPaused(!tickerPaused)}>
+          <span className="ticker-live" />
           BREAKING NEWS
           {tickerPaused ? " ▶" : " ❚❚"}
         </button>
@@ -1793,30 +1755,20 @@ export default function App() {
           {tickerItems.length ? (
             <div
               className={`ticker-track ${tickerPaused ? "paused" : ""}`}
-              style={{
-                animationDuration: `${Math.max(40, tickerItems.length * 7)}s`
-              }}
+              style={{ animationDuration: `${Math.max(40, tickerItems.length * 7)}s` }}
             >
               {[...tickerItems, ...tickerItems].map((item, index) => (
-                <button
-                  className="ticker-item"
-                  key={`${item.id}-${index}`}
-                  onClick={() => setSelected(item)}
-                >
+                <button className="ticker-item" key={`${item.id}-${index}`} onClick={() => setSelected(item)}>
                   <strong>{item.source}</strong>
                   <span>{item.title}</span>
                 </button>
               ))}
             </div>
           ) : (
-            <span className="ticker-empty">
-              Waiting for news feeds...
-            </span>
+            <span className="ticker-empty">Waiting for news feeds...</span>
           )}
         </div>
-
       </div>
-
     </div>
   );
 }
@@ -1837,14 +1789,8 @@ function Layer({
   color: string;
 }) {
   return (
-    <button
-      className="layer-row"
-      onClick={onClick}
-      aria-pressed={checked}
-    >
-      <span className={`layer-icon ${color}`}>
-        {icon}
-      </span>
+    <button className="layer-row" onClick={onClick} aria-pressed={checked}>
+      <span className={`layer-icon ${color}`}>{icon}</span>
 
       <span className="layer-copy">
         <strong>{name}</strong>
@@ -1852,7 +1798,7 @@ function Layer({
       </span>
 
       <span className={`toggle ${checked ? "on" : ""}`}>
-        <i/>
+        <i />
       </span>
     </button>
   );

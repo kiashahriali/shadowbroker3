@@ -6,8 +6,8 @@ A mobile-first, open-source intelligence dashboard starter. This repository cont
 
 - **Earthquakes:** live public USGS GeoJSON feed (past 24 hours).
 - **News:** public RSS feeds from BBC, The Guardian, Al Jazeera, DW and NASA. Feed availability and publisher terms vary.
-- **Aircraft:** OpenSky public API. Anonymous access, rate limits, and coverage can vary. Optional credentials may improve access.
-- **Maritime AIS:** not falsely simulated. A reliable unrestricted global AIS feed is not assumed to be free; connect a provider that explicitly permits your intended use.
+- **Aircraft:** ADSB.lol public API (no key). About 60 regional queries are merged every 60 seconds (`adsb.ts`). Coverage depends on community receivers.
+- **Maritime AIS:** AISStream.io over a server-side WebSocket (`ais.ts`). Requires a free `AISSTREAM_API_KEY`. Without it the layer reports `needs credentials` and stays empty; nothing is simulated.
 - **Conflicts / protests:** not mapped as live geolocated events in this initial release. News headlines are not sufficient evidence for a precise event coordinate. A vetted event dataset and geocoding/verification pipeline are required.
 - **NASA FIRMS:** can be integrated using a free MAP_KEY, but registration is required and it is not enabled in this release.
 
@@ -62,7 +62,7 @@ The app includes a manifest, SVG icon, service worker, and offline app-shell fal
 
 This is a functional first release, not a claim that every OSINT capability is complete:
 1. Add a vetted GDELT event adapter and separate conflict/protest classification with source links and confidence.
-2. Add a provider-configurable AIS adapter; do not scrape restricted feeds.
+2. ~~AIS adapter~~ done via AISStream.io (see `ais.ts`).
 3. Add NASA FIRMS adapter after a free MAP_KEY is configured.
 4. Add persistent Postgres storage, user-defined alert rules, deduplication and audit history.
 5. Add automated tests, rate limiting, structured logs, provider health checks, and production deployment configuration.
@@ -75,3 +75,32 @@ MIT for this project code. Third-party data remains subject to each provider's t
 
 ## Flat-file edition
 All project files are intentionally placed in the repository root for easier upload from a mobile browser. Do not create `src`, `server`, or `public` folders.
+
+
+## Data sources (v3)
+
+| Layer | Source | Key |
+|---|---|---|
+| Aircraft | adsb.lol, adsb.fi, airplanes.live (hex grid of ~570 x 250 nm cells), their `/v2/mil` military feeds, OpenSky global snapshot | none |
+| Ships | Digitraffic AIS (Baltic) + AISStream.io (global, WebSocket) | AISStream: free key |
+| Conflicts / protests | GDELT 2.0 15-minute event exports (CAMEO 14, 18, 19, 20) | none |
+| Satellite imagery | NASA GIBS (GOES-East/West, Himawari every 10 min; VIIRS, MODIS daily) | none |
+| New high-res scenes | Sentinel-2 L2A via Microsoft Planetary Computer STAC + tiler | none |
+| Markets | Yahoo Finance chart API, Binance, gold-api.com, ECB (Frankfurter), Google News RSS | none |
+
+### Check that every source answers from your host
+
+```bash
+npm run selftest
+```
+
+Run it in the Render shell (or locally). It calls each real provider and prints PASS / FAIL.
+
+### Notes on accuracy
+
+* Aircraft: every ADS-B network only sees aircraft heard by volunteer ground receivers, so
+  oceans, Africa and Central Asia are always sparse. That is a physical limit, not a bug.
+* Conflicts / protests: GDELT geocodes the place named in the news article. Country-level
+  matches are dropped; city / province matches are shown as approximate.
+* Markets: free feeds are 15 s - 1 min delayed. The analysis is rule-based (headline wording +
+  simple technicals), not investment advice.
